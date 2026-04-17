@@ -8,10 +8,9 @@
 #include "parsed_reg.hpp"
 #include "reg_file.hpp"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
-
-#include <map>
 
 namespace transpiler {
 
@@ -36,7 +35,7 @@ struct RaiseContext {
   llvm::Type *f16Ty;
   llvm::Type *ptrGlobalTy;
 
-  std::map<uint64_t, llvm::BasicBlock *> &offsetToBB;
+  llvm::DenseMap<uint64_t, llvm::BasicBlock*>& offsetToBB;
 
   llvm::BasicBlock *lookupBB(uint64_t addr);
 

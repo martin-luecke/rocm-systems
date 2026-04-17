@@ -1,6 +1,7 @@
 #include "../code_object_utils.hpp"
 #include "../raiser.hpp"
 
+#include "llvm/ADT/StringMap.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
@@ -8,7 +9,6 @@
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
-#include <map>
 #include <string>
 #include <sys/stat.h>
 #include <vector>
@@ -97,8 +97,8 @@ int main(int argc, char **argv) {
   printf("Code objects: %zu\n\n", coFiles.size());
 
   std::vector<KernelResult> results;
-  std::map<std::string, int> failMnemonics;
-  std::map<std::string, int> failFormats;
+  llvm::StringMap<int> failMnemonics;
+  llvm::StringMap<int> failFormats;
   int totalKernels = 0, successKernels = 0, failedKernels = 0;
   int totalFiles = 0, filesWithSuccess = 0;
 
@@ -187,8 +187,7 @@ int main(int argc, char **argv) {
   if (!failMnemonics.empty()) {
     // Sort by frequency
     std::vector<std::pair<int, std::string>> sorted;
-    for (auto &[mn, cnt] : failMnemonics)
-      sorted.push_back({cnt, mn});
+    for (const auto& E : failMnemonics) sorted.push_back({E.getValue(), std::string(E.getKey())});
     std::sort(sorted.rbegin(), sorted.rend());
 
     printf("Top failing mnemonics:\n");
@@ -205,8 +204,7 @@ int main(int argc, char **argv) {
     printf("  %-20s  %s\n", "Format", "Count");
     printf("  %-20s  %s\n", "--------------------", "-----");
     std::vector<std::pair<int, std::string>> fmtSorted;
-    for (auto &[fmt, cnt] : failFormats)
-      fmtSorted.push_back({cnt, fmt});
+    for (const auto& E : failFormats) fmtSorted.push_back({E.getValue(), std::string(E.getKey())});
     std::sort(fmtSorted.rbegin(), fmtSorted.rend());
     for (auto &[cnt, fmt] : fmtSorted)
       printf("  %-20s  %d\n", fmt.c_str(), cnt);

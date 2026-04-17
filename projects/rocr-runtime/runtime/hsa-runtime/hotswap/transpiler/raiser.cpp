@@ -38,10 +38,9 @@
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
 #include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/IR/Dominators.h"
-
-#include <map>
-#include <set>
 
 using namespace llvm;
 
@@ -74,7 +73,7 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
   ArrayRef<uint8_t> bytes(textBytes.data(), textBytes.size());
   uint64_t totalSize = textBytes.size();
   std::vector<DecodedInst> insts;
-  std::set<uint64_t> blockStarts;
+  DenseSet<uint64_t> blockStarts;
   blockStarts.insert(kernelOffset);
 
   if (kernelOffset > 0)
@@ -167,8 +166,11 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
         // s_endpgm may appear mid-binary (early-return path); if there are
         // known block starts at later offsets, keep disassembling.
         uint64_t nextOff = off + instSize;
-        auto it = blockStarts.upper_bound(off);
-        if (it != blockStarts.end() && *it < textBytes.size()) {
+        uint64_t minGreater = UINT64_MAX;
+        for (uint64_t s : blockStarts) {
+          if (s > off && s < minGreater) minGreater = s;
+        }
+        if (minGreater != UINT64_MAX && minGreater < textBytes.size()) {
           off = nextOff;
           continue;
         }
@@ -247,7 +249,7 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
   Function *fnWorkitemIdX =
       Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_workitem_id_x);
   // ==== Phase 3: Create basic blocks ====
-  std::map<uint64_t, BasicBlock *> offsetToBB;
+  DenseMap<uint64_t, BasicBlock*> offsetToBB;
   for (uint64_t addr : blockStarts)
     offsetToBB[addr] = BasicBlock::Create(C, "bb_0x" + utohexstr(addr - kernelOffset), F);
 
