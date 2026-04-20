@@ -57,21 +57,6 @@ link_directories(${LLVM_LIBRARY_DIRS})
 # --- LLVM definitions ---------------------------------------------------------
 add_definitions(${LLVM_DEFINITIONS})
 
-# --- No-RTTI discipline -------------------------------------------------------
-# LLVM itself is built with `-fno-rtti` by default (LLVM_ENABLE_RTTI=OFF), and
-# every public LLVM type we consume — Value, Type, Instruction, MCInst, ... —
-# relies on LLVM's hand-rolled RTTI (`isa<>` / `cast<>` / `dyn_cast<>`) rather
-# than C++ `typeid` / `dynamic_cast`. Mixing an RTTI-on TU with RTTI-off LLVM
-# libraries produces undefined-reference errors for `typeinfo` symbols on any
-# class that has a virtual method but was compiled without RTTI on the LLVM
-# side. Force the flag on every transpiler target so the whole chain agrees
-# with libLLVM — this is a hard requirement, not a compiler preference, so
-# there is no opt-out and no per-compiler fallback. Salmon builds under
-# clang/gcc on Linux as part of the ROCR build; if a future port targets a
-# compiler with a different spelling, add it explicitly here rather than
-# silently dropping the flag.
-add_compile_options(-fno-rtti)
-
 # --- Raiser + Pipeline library ------------------------------------------------
 add_library(hotswap-transpiler STATIC
   raiser.cpp
