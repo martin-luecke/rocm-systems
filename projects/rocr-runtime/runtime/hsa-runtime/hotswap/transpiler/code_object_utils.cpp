@@ -134,15 +134,14 @@ llvm::msgpack::DocNode *findKey(llvm::msgpack::MapDocNode &map,
 }
 
 // Coerce a msgpack Int/UInt node to int64_t. The AMDGPU metadata verifier
-// accepts either (see `MetadataVerifier::verifyInteger`). Any other kind
-// falls through to 0 — preserves the pre-refactor tolerant behaviour; a
-// strict variant that asserts would be a separate behaviour change.
+// accepts either (see `MetadataVerifier::verifyInteger`); any other kind
+// is a structural invariant violation.
 int64_t nodeInt(const llvm::msgpack::DocNode &n) {
   if (n.getKind() == llvm::msgpack::Type::UInt)
     return static_cast<int64_t>(n.getUInt());
   if (n.getKind() == llvm::msgpack::Type::Int)
     return n.getInt();
-  return 0;
+  llvm_unreachable("nodeInt: msgpack node is neither Int nor UInt");
 }
 
 // Locate the `<kernelName>.kd` symbol and copy its 64 KD bytes into `out`.
