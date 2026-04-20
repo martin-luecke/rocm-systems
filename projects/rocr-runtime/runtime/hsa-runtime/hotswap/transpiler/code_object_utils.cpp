@@ -1,19 +1,26 @@
 #include "code_object_utils.hpp"
 
+#include "llvm/BinaryFormat/AMDGPUMetadataVerifier.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/BinaryFormat/MsgPackDocument.h"
+#include "llvm/Object/Binary.h"
 #include "llvm/Object/ELFObjectFile.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/AMDHSAKernelDescriptor.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <array>
 #include <cstring>
-#include <fstream>
+#include <optional>
 
 namespace transpiler {
 
 namespace {
+
+using OwnedElf = llvm::object::OwningBinary<llvm::object::ELF64LEObjectFile>;
+
 inline uint32_t readU32(const uint8_t *p) {
   uint32_t v;
   std::memcpy(&v, p, sizeof(v));
@@ -23,6 +30,116 @@ inline uint16_t readU16(const uint8_t *p) {
   uint16_t v;
   std::memcpy(&v, p, sizeof(v));
   return v;
+}
+
+// Parse `bytes` as an AMDGPU ELF64LE code object. Errors propagate via
+// `Expected`; callers format their own diagnostic banner.
+llvm::Expected<OwnedElf> openELF64LE(const std::vector<uint8_t> &bytes) {
+  auto buf = llvm::MemoryBuffer::getMemBuffer(
+      llvm::StringRef(reinterpret_cast<const char *>(bytes.data()),
+                      bytes.size()),
+      "", false);
+  auto objOrErr = llvm::object::ObjectFile::createELFObjectFile(*buf);
+  if (!objOrErr)
+    return objOrErr.takeError();
+
+  auto elf = llvm::unique_dyn_cast<llvm::object::ELF64LEObjectFile>(*objOrErr);
+  if (!elf)
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "Not ELF64LE");
+  return OwnedElf(std::move(elf), std::move(buf));
+}
+
+// Walk the ELF note sections looking for the AMDGPU HSA code-object-v3
+// metadata blob, deserialize it via msgpack, and hand the `amdhsa.kernels`
+// array to `accept`. Returns true iff `accept` fired for some note. Logs
+// section/note iterator failures to `errs()` with a fixed prefix.
+bool walkAmdgpuMetadata(
+    const llvm::object::ELF64LEObjectFile &elf,
+    llvm::function_ref<bool(llvm::msgpack::ArrayDocNode &)> accept) {
+  constexpr llvm::StringLiteral kBanner = "transpiler: metadata: ";
+  const auto &elfFile = elf.getELFFile();
+  auto sectionsOrErr = elfFile.sections();
+  if (!sectionsOrErr) {
+    llvm::logAllUnhandledErrors(sectionsOrErr.takeError(), llvm::errs(),
+                                kBanner);
+    return false;
+  }
+
+  for (const auto &shdr : *sectionsOrErr) {
+    if (shdr.sh_type != llvm::ELF::SHT_NOTE)
+      continue;
+
+    llvm::Error err = llvm::Error::success();
+    for (auto note : elfFile.notes(shdr, err)) {
+      if (note.getType() != llvm::ELF::NT_AMDGPU_METADATA ||
+          note.getName() != "AMDGPU")
+        continue;
+
+      llvm::msgpack::Document doc;
+      if (!doc.readFromBlob(note.getDescAsStringRef(4), /*Multi=*/false))
+        continue;
+
+      // Non-strict verify coerces untyped scalars to expected types, matching
+      // what llvm-readobj does. On rejection we keep going with the raw doc
+      // (preserving pre-refactor tolerance) but warn once so genuinely
+      // malformed metadata is visible.
+      if (!llvm::AMDGPU::HSAMD::V3::MetadataVerifier(/*Strict=*/false)
+               .verify(doc.getRoot())) {
+        llvm::errs() << "transpiler: warning: AMDGPU metadata failed "
+                        "non-strict verification; continuing with raw doc\n";
+      }
+
+      auto &root = doc.getRoot();
+      if (!root.isMap())
+        continue;
+      auto kernelsIt = root.getMap().find("amdhsa.kernels");
+      if (kernelsIt == root.getMap().end() || !kernelsIt->second.isArray())
+        continue;
+
+      if (accept(kernelsIt->second.getArray())) {
+        llvm::consumeError(std::move(err));
+        return true;
+      }
+    }
+    if (err) {
+      llvm::logAllUnhandledErrors(std::move(err), llvm::errs(), kBanner);
+      return false;
+    }
+  }
+  return false;
+}
+
+// Locate an ELF section by name. Silently skips sections whose names cannot
+// be decoded. Returns `std::nullopt` if no matching section exists.
+std::optional<llvm::object::SectionRef>
+findSectionByName(const llvm::object::ObjectFile &obj, llvm::StringRef name) {
+  for (const auto &sec : obj.sections()) {
+    auto nameOrErr = sec.getName();
+    if (!nameOrErr) { llvm::consumeError(nameOrErr.takeError()); continue; }
+    if (*nameOrErr == name)
+      return sec;
+  }
+  return std::nullopt;
+}
+
+// Look up a key in a msgpack map; returns nullptr if absent.
+llvm::msgpack::DocNode *findKey(llvm::msgpack::MapDocNode &map,
+                                llvm::StringRef key) {
+  auto it = map.find(key);
+  return it != map.end() ? &it->second : nullptr;
+}
+
+// Coerce a msgpack Int/UInt node to int64_t. The AMDGPU metadata verifier
+// accepts either (see `MetadataVerifier::verifyInteger`). Any other kind
+// falls through to 0 — preserves the pre-refactor tolerant behaviour; a
+// strict variant that asserts would be a separate behaviour change.
+int64_t nodeInt(const llvm::msgpack::DocNode &n) {
+  if (n.getKind() == llvm::msgpack::Type::UInt)
+    return static_cast<int64_t>(n.getUInt());
+  if (n.getKind() == llvm::msgpack::Type::Int)
+    return n.getInt();
+  return 0;
 }
 
 // Locate the `<kernelName>.kd` symbol and copy its 64 KD bytes into `out`.
@@ -42,18 +159,7 @@ bool readKernelDescriptorBytes(llvm::object::ObjectFile &obj,
                                std::array<uint8_t, 64> &out) {
   std::string kdSymName = kernelName + ".kd";
 
-  std::optional<llvm::object::SectionRef> rodataSec;
-  for (const auto &sec : obj.sections()) {
-    auto nameOrErr = sec.getName();
-    if (!nameOrErr) {
-      (void)llvm::toString(nameOrErr.takeError());
-      continue;
-    }
-    if (*nameOrErr == ".rodata") {
-      rodataSec = sec;
-      break;
-    }
-  }
+  auto rodataSec = findSectionByName(obj, ".rodata");
   if (!rodataSec) {
     llvm::errs() << "transpiler: readKernelDescriptorBytes: no .rodata "
                     "section in code object\n";
@@ -135,320 +241,165 @@ void populateKernelDescriptorFields(llvm::object::ObjectFile &obj,
   meta.kernargPreload = readU16(kdBytes.data() + KERNARG_PRELOAD_OFFSET);
   meta.hasKernelDescriptor = true;
 }
+
 } // namespace
 
 std::vector<uint8_t> readFile(const std::string &path) {
-  std::ifstream f(path, std::ios::binary | std::ios::ate);
-  if (!f.is_open()) {
-    llvm::errs() << "transpiler: Cannot open file: " << path << "\n";
+  auto bufOrErr = llvm::MemoryBuffer::getFile(path);
+  if (!bufOrErr) {
+    llvm::errs() << "transpiler: cannot read " << path << ": "
+                 << bufOrErr.getError().message() << "\n";
     return {};
   }
-  auto pos = f.tellg();
-  if (pos < 0) {
-    llvm::errs() << "transpiler: tellg failed for: " << path << "\n";
-    return {};
-  }
-  auto sz = static_cast<size_t>(pos);
-  f.seekg(0);
-  std::vector<uint8_t> data(sz);
-  f.read(reinterpret_cast<char *>(data.data()), sz);
-  if (!f) {
-    llvm::errs() << "transpiler: short read on: " << path << "\n";
-    return {};
-  }
-  return data;
+  llvm::StringRef data = (*bufOrErr)->getBuffer();
+  return std::vector<uint8_t>(data.bytes_begin(), data.bytes_end());
 }
 
 TextSection extractTextSection(const std::vector<uint8_t> &elfData) {
   TextSection result;
-  auto bufOrErr = llvm::MemoryBuffer::getMemBuffer(
-      llvm::StringRef(reinterpret_cast<const char *>(elfData.data()),
-                      elfData.size()),
-      "", false);
-  auto objOrErr = llvm::object::ObjectFile::createELFObjectFile(*bufOrErr);
-  if (!objOrErr) {
-    llvm::errs() << "transpiler: Failed to parse ELF: "
-                 << llvm::toString(objOrErr.takeError()) << "\n";
+  auto ownedOrErr = openELF64LE(elfData);
+  if (!ownedOrErr) {
+    llvm::logAllUnhandledErrors(ownedOrErr.takeError(), llvm::errs(),
+                                "transpiler: ");
     return result;
   }
-  auto &obj = *objOrErr;
-  for (const auto &sec : obj->sections()) {
-    auto nameOrErr = sec.getName();
-    if (!nameOrErr) { (void)llvm::toString(nameOrErr.takeError()); continue; }
-    if (*nameOrErr == ".text") {
-      auto contentsOrErr = sec.getContents();
-      if (!contentsOrErr) { (void)llvm::toString(contentsOrErr.takeError()); continue; }
-      result.bytes.assign(contentsOrErr->begin(), contentsOrErr->end());
-      result.offset = sec.getAddress();
-      result.size = sec.getSize();
-      result.valid = true;
-      return result;
-    }
+  const auto *elf = ownedOrErr->getBinary();
+
+  auto textSec = findSectionByName(*elf, ".text");
+  if (!textSec) {
+    llvm::errs() << "transpiler: .text section not found in ELF\n";
+    return result;
   }
-  llvm::errs() << "transpiler: .text section not found in ELF\n";
+  auto contentsOrErr = textSec->getContents();
+  if (!contentsOrErr) {
+    llvm::errs() << "transpiler: failed to read .text contents: "
+                 << llvm::toString(contentsOrErr.takeError()) << "\n";
+    return result;
+  }
+  result.bytes.assign(contentsOrErr->begin(), contentsOrErr->end());
+  result.offset = textSec->getAddress();
+  result.size = textSec->getSize();
+  result.valid = true;
   return result;
 }
 
 std::vector<std::string> listKernelNames(const std::vector<uint8_t> &elfData) {
   std::vector<std::string> names;
-
-  auto bufOrErr = llvm::MemoryBuffer::getMemBuffer(
-      llvm::StringRef(reinterpret_cast<const char *>(elfData.data()),
-                      elfData.size()),
-      "", false);
-  auto objOrErr = llvm::object::ObjectFile::createELFObjectFile(*bufOrErr);
-  if (!objOrErr) {
-    llvm::errs() << "transpiler: listKernelNames: Failed to parse ELF: "
-                 << llvm::toString(objOrErr.takeError()) << "\n";
+  auto ownedOrErr = openELF64LE(elfData);
+  if (!ownedOrErr) {
+    llvm::logAllUnhandledErrors(ownedOrErr.takeError(), llvm::errs(),
+                                "transpiler: listKernelNames: ");
     return names;
   }
-  auto *elf = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(objOrErr->get());
-  if (!elf) {
-    llvm::errs() << "transpiler: listKernelNames: Not ELF64LE\n";
-    return names;
-  }
+  const auto *elf = ownedOrErr->getBinary();
 
-  auto sectionsOrErr = elf->getELFFile().sections();
-  if (!sectionsOrErr) {
-    (void)llvm::toString(sectionsOrErr.takeError());
-    return names;
-  }
-
-  for (auto &shdr : *sectionsOrErr) {
-    if (shdr.sh_type != 7) // SHT_NOTE
-      continue;
-
-    auto dataOrErr = elf->getELFFile().getSectionContents(shdr);
-    if (!dataOrErr) { (void)llvm::toString(dataOrErr.takeError()); continue; }
-    auto data = *dataOrErr;
-
-    size_t off = 0;
-    while (off + 12 <= data.size()) {
-      uint32_t namesz = readU32(data.data() + off);
-      uint32_t descsz = readU32(data.data() + off + 4);
-      uint32_t type   = readU32(data.data() + off + 8);
-      off += 12;
-
-      uint32_t nameAligned = (namesz + 3) & ~3u;
-      uint64_t needed = static_cast<uint64_t>(nameAligned) + descsz;
-      if (needed > data.size() - off) break;
-
-      const char *noteName = reinterpret_cast<const char *>(data.data() + off);
-      off += nameAligned;
-
-      if (type == 32 && namesz >= 5 &&
-          std::memcmp(noteName, "AMDGPU", 6) == 0) {
-        llvm::StringRef blob(reinterpret_cast<const char *>(data.data() + off),
-                             descsz);
-        llvm::msgpack::Document doc;
-        if (!doc.readFromBlob(blob, false)) {
-          off += (descsz + 3) & ~3u;
-          continue;
-        }
-
-        auto &root = doc.getRoot();
-        if (!root.isMap()) { off += (descsz + 3) & ~3u; continue; }
-        auto &rootMap = root.getMap();
-
-        auto kernelsIt = rootMap.find(doc.getNode("amdhsa.kernels"));
-        if (kernelsIt == rootMap.end()) { off += (descsz + 3) & ~3u; continue; }
-
-        auto &kernelsNode = kernelsIt->second;
-        if (!kernelsNode.isArray()) { off += (descsz + 3) & ~3u; continue; }
-
-        for (auto &kNode : kernelsNode.getArray()) {
-          if (!kNode.isMap()) continue;
-          auto &kMap = kNode.getMap();
-          auto nameIt = kMap.find(doc.getNode(".name"));
-          if (nameIt == kMap.end()) continue;
-          names.push_back(nameIt->second.toString());
-        }
-        return names;
-      }
-      off += (descsz + 3) & ~3;
+  walkAmdgpuMetadata(*elf, [&](llvm::msgpack::ArrayDocNode &kernels) {
+    for (auto &kNode : kernels) {
+      if (!kNode.isMap()) continue;
+      if (auto *n = findKey(kNode.getMap(), ".name"))
+        names.push_back(n->toString());
     }
-  }
-
+    return true; // stop after the first AMDGPU metadata note
+  });
   return names;
 }
 
 KernelMeta extractKernelMeta(const std::vector<uint8_t> &elfData,
                              const std::string &kernelName) {
   KernelMeta meta;
-
-  auto bufOrErr = llvm::MemoryBuffer::getMemBuffer(
-      llvm::StringRef(reinterpret_cast<const char *>(elfData.data()),
-                      elfData.size()),
-      "", false);
-  auto objOrErr = llvm::object::ObjectFile::createELFObjectFile(*bufOrErr);
-  if (!objOrErr) {
-    llvm::errs() << "transpiler: extractKernelMeta: Failed to parse ELF: "
-                 << llvm::toString(objOrErr.takeError()) << "\n";
+  auto ownedOrErr = openELF64LE(elfData);
+  if (!ownedOrErr) {
+    llvm::logAllUnhandledErrors(ownedOrErr.takeError(), llvm::errs(),
+                                "transpiler: extractKernelMeta: ");
     return meta;
   }
-  auto *elf = llvm::dyn_cast<llvm::object::ELF64LEObjectFile>(objOrErr->get());
-  if (!elf) {
-    llvm::errs() << "transpiler: extractKernelMeta: Not ELF64LE\n";
-    return meta;
-  }
+  auto *elf = ownedOrErr->getBinary();
 
-  // Find .note section
-  auto sectionsOrErr = elf->getELFFile().sections();
-  if (!sectionsOrErr) { (void)llvm::toString(sectionsOrErr.takeError()); return meta; }
-
-  for (auto &shdr : *sectionsOrErr) {
-    if (shdr.sh_type != 7) // SHT_NOTE
-      continue;
-
-    auto dataOrErr = elf->getELFFile().getSectionContents(shdr);
-    if (!dataOrErr) { (void)llvm::toString(dataOrErr.takeError()); continue; }
-    auto data = *dataOrErr;
-
-    size_t off = 0;
-    while (off + 12 <= data.size()) {
-      uint32_t namesz = readU32(data.data() + off);
-      uint32_t descsz = readU32(data.data() + off + 4);
-      uint32_t type   = readU32(data.data() + off + 8);
-      off += 12;
-
-      uint32_t nameAligned = (namesz + 3) & ~3u;
-      uint64_t needed = static_cast<uint64_t>(nameAligned) + descsz;
-      if (needed > data.size() - off) break;
-
-      const char *noteName = reinterpret_cast<const char *>(data.data() + off);
-      off += nameAligned;
-
-      if (type == 32 && namesz >= 5 &&
-          std::memcmp(noteName, "AMDGPU", 6) == 0) {
-        llvm::StringRef blob(reinterpret_cast<const char *>(data.data() + off),
-                             descsz);
-        llvm::msgpack::Document doc;
-        if (!doc.readFromBlob(blob, false)) {
-          off += (descsz + 3) & ~3u;
-          continue;
-        }
-
-        auto &root = doc.getRoot();
-        if (!root.isMap()) { off += (descsz + 3) & ~3u; continue; }
-        auto &rootMap = root.getMap();
-
-        auto kernelsIt = rootMap.find(doc.getNode("amdhsa.kernels"));
-        if (kernelsIt == rootMap.end()) { off += (descsz + 3) & ~3u; continue; }
-
-        auto &kernelsNode = kernelsIt->second;
-        if (!kernelsNode.isArray()) { off += (descsz + 3) & ~3; continue; }
-
-        for (auto &kNode : kernelsNode.getArray()) {
+  bool found = walkAmdgpuMetadata(
+      *elf, [&](llvm::msgpack::ArrayDocNode &kernels) {
+        for (auto &kNode : kernels) {
           if (!kNode.isMap()) continue;
           auto &kMap = kNode.getMap();
 
-          auto nameIt = kMap.find(doc.getNode(".name"));
-          if (nameIt == kMap.end()) continue;
-          std::string kName = nameIt->second.toString();
-          if (kName != kernelName) continue;
+          auto *nameNode = findKey(kMap, ".name");
+          if (!nameNode || nameNode->toString() != kernelName)
+            continue;
 
-          meta.name = kName;
+          meta.name = kernelName;
+          if (auto *n = findKey(kMap, ".kernarg_segment_size"))
+            meta.kernargSegmentSize = nodeInt(*n);
+          if (auto *n = findKey(kMap, ".group_segment_fixed_size"))
+            meta.groupSegmentFixedSize = nodeInt(*n);
+          if (auto *n = findKey(kMap, ".private_segment_fixed_size"))
+            meta.privateSegmentFixedSize = nodeInt(*n);
+          if (auto *n = findKey(kMap, ".max_flat_workgroup_size"))
+            meta.maxFlatWorkgroupSize = nodeInt(*n);
 
-          auto getNodeInt = [](llvm::msgpack::DocNode &n) -> int64_t {
-            if (n.getKind() == llvm::msgpack::Type::Int) return n.getInt();
-            if (n.getKind() == llvm::msgpack::Type::UInt) return static_cast<int64_t>(n.getUInt());
-            return 0;
-          };
-
-          auto kasIt = kMap.find(doc.getNode(".kernarg_segment_size"));
-          if (kasIt != kMap.end())
-            meta.kernargSegmentSize = getNodeInt(kasIt->second);
-
-          auto gsfIt = kMap.find(doc.getNode(".group_segment_fixed_size"));
-          if (gsfIt != kMap.end())
-            meta.groupSegmentFixedSize = getNodeInt(gsfIt->second);
-
-          auto psfIt = kMap.find(doc.getNode(".private_segment_fixed_size"));
-          if (psfIt != kMap.end())
-            meta.privateSegmentFixedSize = getNodeInt(psfIt->second);
-
-          auto mfwIt = kMap.find(doc.getNode(".max_flat_workgroup_size"));
-          if (mfwIt != kMap.end())
-            meta.maxFlatWorkgroupSize = getNodeInt(mfwIt->second);
-
-          auto argsIt = kMap.find(doc.getNode(".args"));
-          if (argsIt != kMap.end() && argsIt->second.isArray()) {
-            for (auto &argNode : argsIt->second.getArray()) {
+          if (auto *argsNode = findKey(kMap, ".args");
+              argsNode && argsNode->isArray()) {
+            for (auto &argNode : argsNode->getArray()) {
               if (!argNode.isMap()) continue;
               auto &aMap = argNode.getMap();
               KernelArgMeta am;
-              auto f = [&](const char *key) -> llvm::msgpack::DocNode * {
-                auto it = aMap.find(doc.getNode(key));
-                return (it != aMap.end()) ? &it->second : nullptr;
-              };
-              if (auto *n = f(".name")) am.name = n->toString();
-              if (auto *n = f(".offset")) am.offset = getNodeInt(*n);
-              if (auto *n = f(".size")) am.size = getNodeInt(*n);
-              if (auto *n = f(".value_kind")) am.valueKind = n->toString();
-              if (auto *n = f(".address_space")) am.addressSpace = getNodeInt(*n);
+              if (auto *n = findKey(aMap, ".name")) am.name = n->toString();
+              if (auto *n = findKey(aMap, ".offset")) am.offset = nodeInt(*n);
+              if (auto *n = findKey(aMap, ".size")) am.size = nodeInt(*n);
+              if (auto *n = findKey(aMap, ".value_kind")) am.valueKind = n->toString();
+              if (auto *n = findKey(aMap, ".address_space"))
+                am.addressSpace = nodeInt(*n);
               meta.args.push_back(am);
             }
           }
-
-          // Parse the KD bytes from .rodata once we know the kernel name
-          // matched. populateKernelDescriptorFields sets
-          // meta.hasKernelDescriptor on success and emits a diagnostic on
-          // failure; the caller (raiser / Phase-4 init) is responsible for
-          // refusing the lift if the field is false rather than silently
-          // assuming a hardcoded SGPR layout.
-          populateKernelDescriptorFields(*objOrErr->get(), meta);
-          return meta;
+          return true;
         }
-      }
-      off += (descsz + 3) & ~3;
-    }
+        return false;
+      });
+  if (!found) {
+    llvm::errs() << "transpiler: extractKernelMeta: kernel '" << kernelName
+                 << "' not found in metadata\n";
+    return meta;
   }
 
-  llvm::errs() << "transpiler: extractKernelMeta: kernel '" << kernelName
-               << "' not found in metadata\n";
+  // Parse the KD bytes from .rodata once we know the kernel name
+  // matched. populateKernelDescriptorFields sets
+  // meta.hasKernelDescriptor on success and emits a diagnostic on
+  // failure; the caller (raiser / Phase-4 init) is responsible for
+  // refusing the lift if the field is false rather than silently
+  // assuming a hardcoded SGPR layout.
+  populateKernelDescriptorFields(*elf, meta);
   return meta;
 }
 
 uint64_t findKernelSymbolOffset(const std::vector<uint8_t> &elfData,
                                 const std::string &kernelName) {
-  auto bufOrErr = llvm::MemoryBuffer::getMemBuffer(
-      llvm::StringRef(reinterpret_cast<const char *>(elfData.data()),
-                      elfData.size()),
-      "", false);
-  auto objOrErr = llvm::object::ObjectFile::createELFObjectFile(*bufOrErr);
-  if (!objOrErr) {
-    llvm::errs() << "transpiler: findKernelSymbolOffset: Failed to parse ELF: "
-                 << llvm::toString(objOrErr.takeError()) << "\n";
+  auto ownedOrErr = openELF64LE(elfData);
+  if (!ownedOrErr) {
+    llvm::logAllUnhandledErrors(ownedOrErr.takeError(), llvm::errs(),
+                                "transpiler: findKernelSymbolOffset: ");
     return 0;
   }
+  const auto *elf = ownedOrErr->getBinary();
 
-  uint64_t textBase = UINT64_MAX;
-  for (const auto &sec : (*objOrErr)->sections()) {
-    auto nameOrErr = sec.getName();
-    if (nameOrErr && *nameOrErr == ".text") {
-      textBase = sec.getAddress();
-      break;
-    }
-  }
-  if (textBase == UINT64_MAX) {
+  auto textSec = findSectionByName(*elf, ".text");
+  if (!textSec) {
     llvm::errs() << "transpiler: findKernelSymbolOffset: no .text section found\n";
     return 0;
   }
+  const uint64_t textBase = textSec->getAddress();
 
-  for (const auto &sym : (*objOrErr)->symbols()) {
+  for (const auto &sym : elf->symbols()) {
     auto nameOrErr = sym.getName();
-    if (!nameOrErr) { (void)llvm::toString(nameOrErr.takeError()); continue; }
-    if (*nameOrErr == kernelName) {
-      auto addrOrErr = sym.getAddress();
-      if (!addrOrErr) { (void)llvm::toString(addrOrErr.takeError()); continue; }
-      if (*addrOrErr < textBase) {
-        llvm::errs() << "transpiler: findKernelSymbolOffset: symbol address 0x"
-                     << llvm::utohexstr(*addrOrErr) << " < .text base 0x"
-                     << llvm::utohexstr(textBase) << "\n";
-        return 0;
-      }
-      return *addrOrErr - textBase;
+    if (!nameOrErr) { llvm::consumeError(nameOrErr.takeError()); continue; }
+    if (*nameOrErr != kernelName) continue;
+    auto addrOrErr = sym.getAddress();
+    if (!addrOrErr) { llvm::consumeError(addrOrErr.takeError()); continue; }
+    if (*addrOrErr < textBase) {
+      llvm::errs() << "transpiler: findKernelSymbolOffset: symbol address 0x"
+                   << llvm::utohexstr(*addrOrErr) << " < .text base 0x"
+                   << llvm::utohexstr(textBase) << "\n";
+      return 0;
     }
+    return *addrOrErr - textBase;
   }
 
   llvm::errs() << "transpiler: findKernelSymbolOffset: symbol '" << kernelName

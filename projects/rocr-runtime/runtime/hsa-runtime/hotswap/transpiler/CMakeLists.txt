@@ -183,6 +183,12 @@ target_include_directories(hotswap-transpiler PRIVATE
 # (libhsa-runtime64.so when consumed from ROCR).
 set_target_properties(hotswap-transpiler PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# LLVM is built with RTTI disabled by default.  Match it so that inline
+# LLVM helpers (e.g. `consumeError`, `Expected<T>` with non-trivial T) do
+# not instantiate `typeinfo for llvm::ErrorInfoBase` references in our
+# TUs that LLVM's libs — built without typeinfo — cannot satisfy.
+target_compile_options(hotswap-transpiler PRIVATE -fno-rtti)
+
 # Public headers consumed by parent projects (pipeline.hpp, transpiler.hpp).
 # Use the hotswap/ root so consumers can write `#include "hotswap/transpiler/pipeline.hpp"`
 # or `#include "hotswap/transpiler.hpp"`, matching existing ROCR usage.
