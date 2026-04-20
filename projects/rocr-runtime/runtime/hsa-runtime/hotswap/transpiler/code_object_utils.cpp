@@ -32,21 +32,24 @@ inline uint16_t readU16(const uint8_t *p) {
   return v;
 }
 
-// Parse `bytes` as an AMDGPU ELF64LE code object. Errors propagate via
-// `Expected`; callers format their own diagnostic banner.
-llvm::Expected<OwnedElf> openELF64LE(const std::vector<uint8_t> &bytes) {
+// Parse `bytes` as an AMDGPU ELF64LE code object. Failing to open the ELF
+// is fatal: every downstream query needs a valid parsed object, so there
+// is nothing a caller could meaningfully do with a failure.
+OwnedElf openELF64LE(const std::vector<uint8_t> &bytes) {
   auto buf = llvm::MemoryBuffer::getMemBuffer(
       llvm::StringRef(reinterpret_cast<const char *>(bytes.data()),
                       bytes.size()),
       "", false);
   auto objOrErr = llvm::object::ObjectFile::createELFObjectFile(*buf);
   if (!objOrErr)
-    return objOrErr.takeError();
+    llvm::report_fatal_error(
+        llvm::Twine("transpiler: failed to parse ELF: ") +
+        llvm::toString(objOrErr.takeError()));
 
   auto elf = llvm::unique_dyn_cast<llvm::object::ELF64LEObjectFile>(*objOrErr);
   if (!elf)
-    return llvm::createStringError(llvm::inconvertibleErrorCode(),
-                                   "Not ELF64LE");
+    llvm::report_fatal_error("transpiler: code object is not ELF64LE");
+
   return OwnedElf(std::move(elf), std::move(buf));
 }
 
@@ -257,13 +260,8 @@ std::vector<uint8_t> readFile(const std::string &path) {
 
 TextSection extractTextSection(const std::vector<uint8_t> &elfData) {
   TextSection result;
-  auto ownedOrErr = openELF64LE(elfData);
-  if (!ownedOrErr) {
-    llvm::logAllUnhandledErrors(ownedOrErr.takeError(), llvm::errs(),
-                                "transpiler: ");
-    return result;
-  }
-  const auto *elf = ownedOrErr->getBinary();
+  auto owned = openELF64LE(elfData);
+  const auto *elf = owned.getBinary();
 
   auto textSec = findSectionByName(*elf, ".text");
   if (!textSec) {
@@ -285,13 +283,8 @@ TextSection extractTextSection(const std::vector<uint8_t> &elfData) {
 
 std::vector<std::string> listKernelNames(const std::vector<uint8_t> &elfData) {
   std::vector<std::string> names;
-  auto ownedOrErr = openELF64LE(elfData);
-  if (!ownedOrErr) {
-    llvm::logAllUnhandledErrors(ownedOrErr.takeError(), llvm::errs(),
-                                "transpiler: listKernelNames: ");
-    return names;
-  }
-  const auto *elf = ownedOrErr->getBinary();
+  auto owned = openELF64LE(elfData);
+  const auto *elf = owned.getBinary();
 
   walkAmdgpuMetadata(*elf, [&](llvm::msgpack::ArrayDocNode &kernels) {
     for (auto &kNode : kernels) {
@@ -307,13 +300,8 @@ std::vector<std::string> listKernelNames(const std::vector<uint8_t> &elfData) {
 KernelMeta extractKernelMeta(const std::vector<uint8_t> &elfData,
                              const std::string &kernelName) {
   KernelMeta meta;
-  auto ownedOrErr = openELF64LE(elfData);
-  if (!ownedOrErr) {
-    llvm::logAllUnhandledErrors(ownedOrErr.takeError(), llvm::errs(),
-                                "transpiler: extractKernelMeta: ");
-    return meta;
-  }
-  auto *elf = ownedOrErr->getBinary();
+  auto owned = openELF64LE(elfData);
+  auto *elf = owned.getBinary();
 
   bool found = walkAmdgpuMetadata(
       *elf, [&](llvm::msgpack::ArrayDocNode &kernels) {
@@ -372,13 +360,8 @@ KernelMeta extractKernelMeta(const std::vector<uint8_t> &elfData,
 
 uint64_t findKernelSymbolOffset(const std::vector<uint8_t> &elfData,
                                 const std::string &kernelName) {
-  auto ownedOrErr = openELF64LE(elfData);
-  if (!ownedOrErr) {
-    llvm::logAllUnhandledErrors(ownedOrErr.takeError(), llvm::errs(),
-                                "transpiler: findKernelSymbolOffset: ");
-    return 0;
-  }
-  const auto *elf = ownedOrErr->getBinary();
+  auto owned = openELF64LE(elfData);
+  const auto *elf = owned.getBinary();
 
   auto textSec = findSectionByName(*elf, ".text");
   if (!textSec) {
