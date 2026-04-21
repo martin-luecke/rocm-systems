@@ -170,18 +170,9 @@ global_load_async_to_lds_kernel:
 ---
 amdhsa.kernels:
   - .args:
-      - .address_space:  global
-        .offset:         0
-        .size:           8
-        .value_kind:     global_buffer
-      - .address_space:  global
-        .offset:         8
-        .size:           8
-        .value_kind:     global_buffer
-      - .address_space:  global
-        .offset:         16
-        .size:           8
-        .value_kind:     global_buffer
+      - { .address_space:  global, .offset:         0, .size:           8, .value_kind:     global_buffer }
+      - { .address_space:  global, .offset:         8, .size:           8, .value_kind:     global_buffer }
+      - { .address_space:  global, .offset:         16, .size:           8, .value_kind:     global_buffer }
     .group_segment_fixed_size: 1792
     .kernarg_segment_align: 8
     .kernarg_segment_size: 24
@@ -192,9 +183,7 @@ amdhsa.kernels:
     .symbol:         global_load_async_to_lds_kernel.kd
     .vgpr_count:     2
     .wavefront_size: 32
-amdhsa.version:
-  - 1
-  - 2
+amdhsa.version: [1, 2]
 ...
 
 	.end_amdgpu_metadata

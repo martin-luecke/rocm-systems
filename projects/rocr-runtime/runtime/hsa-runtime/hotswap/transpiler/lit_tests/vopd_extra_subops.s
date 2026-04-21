@@ -167,14 +167,8 @@ vopd_extra_subops_kernel:
 ---
 amdhsa.kernels:
   - .args:
-      - .address_space:  global
-        .offset:         0
-        .size:           8
-        .value_kind:     global_buffer
-      - .address_space:  global
-        .offset:         8
-        .size:           8
-        .value_kind:     global_buffer
+      - { .address_space:  global, .offset:         0, .size:           8, .value_kind:     global_buffer }
+      - { .address_space:  global, .offset:         8, .size:           8, .value_kind:     global_buffer }
     .group_segment_fixed_size: 0
     .kernarg_segment_align: 8
     .kernarg_segment_size: 16
@@ -185,9 +179,7 @@ amdhsa.kernels:
     .symbol:         vopd_extra_subops_kernel.kd
     .vgpr_count:     7
     .wavefront_size: 32
-amdhsa.version:
-  - 1
-  - 2
+amdhsa.version: [1, 2]
 ...
 
 	.end_amdgpu_metadata

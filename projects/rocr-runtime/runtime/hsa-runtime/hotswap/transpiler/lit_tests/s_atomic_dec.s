@@ -115,20 +115,10 @@ s_atomic_dec_kernel:                    ; @s_atomic_dec_kernel
 ---
 amdhsa.kernels:
   - .args:
-      - .address_space:  global
-        .offset:         0
-        .size:           8
-        .value_kind:     global_buffer
-      - .offset:         8
-        .size:           4
-        .value_kind:     by_value
-      - .offset:         12
-        .size:           4
-        .value_kind:     by_value
-      - .address_space:  global
-        .offset:         16
-        .size:           8
-        .value_kind:     global_buffer
+      - { .address_space:  global, .offset:         0, .size:           8, .value_kind:     global_buffer }
+      - { .offset:         8, .size:           4, .value_kind:     by_value }
+      - { .offset:         12, .size:           4, .value_kind:     by_value }
+      - { .address_space:  global, .offset:         16, .size:           8, .value_kind:     global_buffer }
     .group_segment_fixed_size: 0
     .kernarg_segment_align: 8
     .kernarg_segment_size: 24
@@ -139,9 +129,7 @@ amdhsa.kernels:
     .symbol:         s_atomic_dec_kernel.kd
     .vgpr_count:     2
     .wavefront_size: 64
-amdhsa.version:
-  - 1
-  - 2
+amdhsa.version: [1, 2]
 ...
 
 	.end_amdgpu_metadata

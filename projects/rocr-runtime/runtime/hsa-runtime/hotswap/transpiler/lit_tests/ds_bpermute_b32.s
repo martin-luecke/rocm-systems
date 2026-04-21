@@ -93,56 +93,9 @@ ds_bpermute_b32_kernel:
 ---
 amdhsa.kernels:
   - .args:
-      - .address_space:  global
-        .offset:         0
-        .size:           8
-        .value_kind:     global_buffer
-      - .address_space:  global
-        .offset:         8
-        .size:           8
-        .value_kind:     global_buffer
-      - .offset:         16
-        .size:           4
-        .value_kind:     by_value
-      - .offset:         24
-        .size:           4
-        .value_kind:     hidden_block_count_x
-      - .offset:         28
-        .size:           4
-        .value_kind:     hidden_block_count_y
-      - .offset:         32
-        .size:           4
-        .value_kind:     hidden_block_count_z
-      - .offset:         36
-        .size:           2
-        .value_kind:     hidden_group_size_x
-      - .offset:         38
-        .size:           2
-        .value_kind:     hidden_group_size_y
-      - .offset:         40
-        .size:           2
-        .value_kind:     hidden_group_size_z
-      - .offset:         42
-        .size:           2
-        .value_kind:     hidden_remainder_x
-      - .offset:         44
-        .size:           2
-        .value_kind:     hidden_remainder_y
-      - .offset:         46
-        .size:           2
-        .value_kind:     hidden_remainder_z
-      - .offset:         64
-        .size:           8
-        .value_kind:     hidden_global_offset_x
-      - .offset:         72
-        .size:           8
-        .value_kind:     hidden_global_offset_y
-      - .offset:         80
-        .size:           8
-        .value_kind:     hidden_global_offset_z
-      - .offset:         88
-        .size:           2
-        .value_kind:     hidden_grid_dims
+      - { .address_space:  global, .offset:         0, .size:           8, .value_kind:     global_buffer }
+      - { .address_space:  global, .offset:         8, .size:           8, .value_kind:     global_buffer }
+      - { .offset:         16, .size:           4, .value_kind:     by_value }
     .group_segment_fixed_size: 0
     .kernarg_segment_align: 8
     .kernarg_segment_size: 280
@@ -153,9 +106,7 @@ amdhsa.kernels:
     .symbol:         ds_bpermute_b32_kernel.kd
     .vgpr_count:     6
     .wavefront_size: 64
-amdhsa.version:
-  - 1
-  - 2
+amdhsa.version: [1, 2]
 ...
 
 	.end_amdgpu_metadata

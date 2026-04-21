@@ -146,13 +146,8 @@ s_load_b96_kernarg_kernel:
 ---
 amdhsa.kernels:
   - .args:
-      - .offset:         0
-        .size:           16
-        .value_kind:     by_value
-      - .address_space:  global
-        .offset:         16
-        .size:           8
-        .value_kind:     global_buffer
+      - { .offset:         0, .size:           16, .value_kind:     by_value }
+      - { .address_space:  global, .offset:         16, .size:           8, .value_kind:     global_buffer }
     .group_segment_fixed_size: 0
     .kernarg_segment_align: 8
     .kernarg_segment_size: 24
@@ -163,9 +158,7 @@ amdhsa.kernels:
     .symbol:         s_load_b96_kernarg_kernel.kd
     .vgpr_count:     8
     .wavefront_size: 32
-amdhsa.version:
-  - 1
-  - 2
+amdhsa.version: [1, 2]
 ...
 
 	.end_amdgpu_metadata

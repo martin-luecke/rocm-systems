@@ -119,10 +119,7 @@ v_cmpx_ballot_kernel:
 ---
 amdhsa.kernels:
   - .args:
-      - .address_space:  global
-        .offset:         0
-        .size:           8
-        .value_kind:     global_buffer
+      - { .address_space:  global, .offset:         0, .size:           8, .value_kind:     global_buffer }
     .group_segment_fixed_size: 0
     .kernarg_segment_align: 8
     .kernarg_segment_size: 8
@@ -133,9 +130,7 @@ amdhsa.kernels:
     .symbol:         v_cmpx_ballot_kernel.kd
     .vgpr_count:     2
     .wavefront_size: 32
-amdhsa.version:
-  - 1
-  - 2
+amdhsa.version: [1, 2]
 ...
 
 	.end_amdgpu_metadata

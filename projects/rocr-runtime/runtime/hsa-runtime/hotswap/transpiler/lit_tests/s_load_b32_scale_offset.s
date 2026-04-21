@@ -108,18 +108,9 @@ s_load_b32_scale_offset_kernel:         ; @s_load_b32_scale_offset_kernel
 ---
 amdhsa.kernels:
   - .args:
-      - .actual_access:  write_only
-        .address_space:  global
-        .offset:         0
-        .size:           8
-        .value_kind:     global_buffer
-      - .address_space:  global
-        .offset:         8
-        .size:           8
-        .value_kind:     global_buffer
-      - .offset:         16
-        .size:           4
-        .value_kind:     by_value
+      - { .actual_access:  write_only, .address_space:  global, .offset:         0, .size:           8, .value_kind:     global_buffer }
+      - { .address_space:  global, .offset:         8, .size:           8, .value_kind:     global_buffer }
+      - { .offset:         16, .size:           4, .value_kind:     by_value }
     .group_segment_fixed_size: 0
     .kernarg_segment_align: 8
     .kernarg_segment_size: 20
@@ -130,9 +121,7 @@ amdhsa.kernels:
     .symbol:         s_load_b32_scale_offset_kernel.kd
     .vgpr_count:     2
     .wavefront_size: 32
-amdhsa.version:
-  - 1
-  - 2
+amdhsa.version: [1, 2]
 ...
 
 	.end_amdgpu_metadata

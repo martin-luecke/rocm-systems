@@ -97,49 +97,7 @@ c4_lane_dep_cmpx_kernel:
 ---
 amdhsa.kernels:
   - .args:
-      - .address_space:  global
-        .offset:         0
-        .size:           8
-        .value_kind:     global_buffer
-      - .offset:         8
-        .size:           4
-        .value_kind:     hidden_block_count_x
-      - .offset:         12
-        .size:           4
-        .value_kind:     hidden_block_count_y
-      - .offset:         16
-        .size:           4
-        .value_kind:     hidden_block_count_z
-      - .offset:         20
-        .size:           2
-        .value_kind:     hidden_group_size_x
-      - .offset:         22
-        .size:           2
-        .value_kind:     hidden_group_size_y
-      - .offset:         24
-        .size:           2
-        .value_kind:     hidden_group_size_z
-      - .offset:         26
-        .size:           2
-        .value_kind:     hidden_remainder_x
-      - .offset:         28
-        .size:           2
-        .value_kind:     hidden_remainder_y
-      - .offset:         30
-        .size:           2
-        .value_kind:     hidden_remainder_z
-      - .offset:         48
-        .size:           8
-        .value_kind:     hidden_global_offset_x
-      - .offset:         56
-        .size:           8
-        .value_kind:     hidden_global_offset_y
-      - .offset:         64
-        .size:           8
-        .value_kind:     hidden_global_offset_z
-      - .offset:         72
-        .size:           2
-        .value_kind:     hidden_grid_dims
+      - { .address_space:  global, .offset:         0, .size:           8, .value_kind:     global_buffer }
     .group_segment_fixed_size: 0
     .kernarg_segment_align: 8
     .kernarg_segment_size: 264
@@ -150,9 +108,7 @@ amdhsa.kernels:
     .symbol:         c4_lane_dep_cmpx_kernel.kd
     .vgpr_count:     11
     .wavefront_size: 32
-amdhsa.version:
-  - 1
-  - 2
+amdhsa.version: [1, 2]
 ...
 
 	.end_amdgpu_metadata

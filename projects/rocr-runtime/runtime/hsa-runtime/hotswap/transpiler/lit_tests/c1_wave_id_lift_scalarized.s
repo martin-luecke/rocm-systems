@@ -178,61 +178,10 @@ c1_wave_id_lift_scalarized_kernel:      ; @c1_wave_id_lift_scalarized_kernel
 ---
 amdhsa.kernels:
   - .args:
-      - .address_space:  global
-        .offset:         0
-        .size:           8
-        .value_kind:     global_buffer
-      - .address_space:  global
-        .offset:         8
-        .size:           8
-        .value_kind:     global_buffer
-      - .address_space:  global
-        .offset:         16
-        .size:           8
-        .value_kind:     global_buffer
-      - .address_space:  global
-        .offset:         24
-        .size:           8
-        .value_kind:     global_buffer
-      - .offset:         32
-        .size:           4
-        .value_kind:     hidden_block_count_x
-      - .offset:         36
-        .size:           4
-        .value_kind:     hidden_block_count_y
-      - .offset:         40
-        .size:           4
-        .value_kind:     hidden_block_count_z
-      - .offset:         44
-        .size:           2
-        .value_kind:     hidden_group_size_x
-      - .offset:         46
-        .size:           2
-        .value_kind:     hidden_group_size_y
-      - .offset:         48
-        .size:           2
-        .value_kind:     hidden_group_size_z
-      - .offset:         50
-        .size:           2
-        .value_kind:     hidden_remainder_x
-      - .offset:         52
-        .size:           2
-        .value_kind:     hidden_remainder_y
-      - .offset:         54
-        .size:           2
-        .value_kind:     hidden_remainder_z
-      - .offset:         72
-        .size:           8
-        .value_kind:     hidden_global_offset_x
-      - .offset:         80
-        .size:           8
-        .value_kind:     hidden_global_offset_y
-      - .offset:         88
-        .size:           8
-        .value_kind:     hidden_global_offset_z
-      - .offset:         96
-        .size:           2
-        .value_kind:     hidden_grid_dims
+      - { .address_space:  global, .offset:         0, .size:           8, .value_kind:     global_buffer }
+      - { .address_space:  global, .offset:         8, .size:           8, .value_kind:     global_buffer }
+      - { .address_space:  global, .offset:         16, .size:           8, .value_kind:     global_buffer }
+      - { .address_space:  global, .offset:         24, .size:           8, .value_kind:     global_buffer }
     .group_segment_fixed_size: 0
     .kernarg_segment_align: 8
     .kernarg_segment_size: 288
@@ -243,9 +192,7 @@ amdhsa.kernels:
     .symbol:         c1_wave_id_lift_scalarized_kernel.kd
     .vgpr_count:     27
     .wavefront_size: 32
-amdhsa.version:
-  - 1
-  - 2
+amdhsa.version: [1, 2]
 ...
 
 	.end_amdgpu_metadata

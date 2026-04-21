@@ -108,9 +108,7 @@ ds_store_b16_d16_hi_kernel:
 ---
 amdhsa.kernels:
   - .args:
-      - .offset:         0
-        .size:           4
-        .value_kind:     by_value
+      - { .offset:         0, .size:           4, .value_kind:     by_value }
     .group_segment_fixed_size: 4
     .kernarg_segment_align: 4
     .kernarg_segment_size: 4
@@ -121,9 +119,7 @@ amdhsa.kernels:
     .symbol:         ds_store_b16_d16_hi_kernel.kd
     .vgpr_count:     3
     .wavefront_size: 32
-amdhsa.version:
-  - 1
-  - 2
+amdhsa.version: [1, 2]
 ...
 
 	.end_amdgpu_metadata
