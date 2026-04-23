@@ -1146,6 +1146,103 @@ EXIT=2 (refuse), and the gate's diagnostic in
 `handle_valu_vop3p.cpp` now surfaces the `matmul_fp16_16x16` WIN
 and the `matmul_fp16` OPEN items explicitly.
 
+### 12.4.4 Session-5 per-dword characterization (2026-04-23)
+
+Adding inline IR instrumentation (text-patched `global_store`
+immediately before the `wmma.f32.16x16x32.f16` intrinsic build)
+pinned the per-lane K distribution of BOTH operand slots by
+running the kernel with distinguishing input modes.
+
+**Harness** (`/tmp/instrument.py` + extended `/tmp/matmul_test.cpp`):
+the patched IR writes 16 dwords per lane (v170.2..v177.2 for
+WMMA.B, v186.3..v193.3 AND v194.3..v201.3 for WMMA.A) to a
+kernarg-added debug buffer, read back and decoded per lane.
+Mode 7 (`A[i,k]=k/32`, `B=1s`) and mode 9 (`A[i,k]=i+k*32`,
+`B=1s`) let the value at any half uniquely identify the
+Triton-matrix coordinate the WMMA fragment holds; modes 8 and 10
+do the same for Triton.B.
+
+**WMMA.B operand (v170-177) per-lane layout** (empirically pinned,
+K-split between lane halves — matches the `gfx12` WMMA doc
+comment in `wmma_lowering.cpp::redistributeInput` verbatim):
+
+| Lanes | dw{0,1} | dw{2,3} | dw{4,5} | dw{6,7} |
+|-------|---------|---------|---------|---------|
+| 0-15  | k=0-3   | k=8-11  | k=16-19 | k=24-27 |
+| 16-31 | k=4-7   | k=12-15 | k=20-23 | k=28-31 |
+
+Each lane holds row=L%16 of the WMMA.B-slot operand (which in
+Triton's swapped layout holds Triton.A data) across 16 K-values
+per lane.  Lanes 0 and 16 both hold row 0, with disjoint K sets
+that together span K=0..31.  The current `redistributeInput` is
+CORRECT for this layout (verified by modes 6 and 7 passing —
+both have Triton.B=1s so only the WMMA.B redistribution can
+surface variation).
+
+**WMMA.A operand (v186-193) per-lane layout** (empirically pinned,
+SURPRISE: NOT K-split — col-split between lane halves, SAME K set
+at each GPR position across both halves):
+
+| Lanes | dw{0,1} | dw{2,3} | dw{4,5} | dw{6,7} |
+|-------|---------|---------|---------|---------|
+| 0-15  | k=8-11 col=16+L%16 | k=12-15 col=16+L%16 | k=24-27 col=16+L%16 | k=28-31 col=16+L%16 |
+| 16-31 | k=8-11 col=L%16    | k=12-15 col=L%16    | k=24-27 col=L%16    | k=28-31 col=L%16    |
+
+Lanes 0-15 hold cols 16-31 and lanes 16-31 hold cols 0-15 of
+Triton.B.  Both halves hold the SAME K subset (`{8-15, 24-31}`).
+The OTHER K subset (`{0-7, 16-23}`) is in v194-201 with the same
+col-split pattern — so together v186-v201 (16 VGPRs × 32 lanes ×
+2 halves/dw = 1024 halves) covers Triton.B's full 32×32.  But
+the WMMA instruction consumes only v186-193 (8 VGPRs) as its A
+operand — per the instruction encoding and the LLVM intrinsic
+signature (`<16 x half>` A, `<16 x half>` B).
+
+**This is the remaining open question**: how does the gfx1250
+WMMA hardware assemble a full 16×32 A matrix from v186-193's 512
+halves when those halves only cover 16 K values × 32 cols (not
+32 K × 16 rows)?  One possibility: the hardware has an
+implicit-stride read pattern that treats v[A:A+7] and v[A+8:A+15]
+as a single operand (matrix_b_reuse extension); another: the
+(row_hw, K_hw) lane/dw/half mapping is a non-trivial permutation
+that still yields a valid 16×32 matrix when interpreted by the
+matmul unit.  Neither matches any documented layout in
+`/home/mluecke/llvm-project/llvm/lib/Target/AMDGPU/VOP3PInstructions.td`
+or its surrounding lowering code.
+
+**Consequence for the MFMA lowering**: `redistributeInput` is
+symmetric across A and B (same code path for `aDwords` and
+`bDwords`), so the K-split assumption bakes in for WMMA.A too.
+Mode 8 (`B[k,j]=k/32`, where Triton.B → WMMA.A slot is K-varying)
+surfaces this as a uniform +4 error on every output cell:
+`got = 19.5 vs ref = 15.5`.  Hand-calc confirms both MFMA-1 and
+MFMA-2 double-count `{k=8-15, 24-31}` and miss `{0-7, 16-23}` —
+consistent with the col-split layout returning the same K set for
+LG0/LG1 and LG2/LG3 (and zero coverage of the `{0-7, 16-23}` K
+half that lives in v194-201).
+
+**Gate reinstated**: the refusal gate in
+`handle_valu_vop3p.cpp` now cites §12.4.4 directly.  Fixing this
+requires one of:
+
+  1. Decoding the gfx1250 WMMA.A ISA layout (how lane L, dw g, half h
+     maps to (row_hw, K_hw)) and writing an asymmetric
+     `redistributeInput_A` that accounts for it.
+  2. Lifting `v_permlane16_swap_b32` differently so that its post-
+     swap data matches the K-split layout that `redistributeInput`
+     assumes, rather than the observed col-split.  (The pre-swap
+     data layout is unobserved; Session-6 TODO.)
+  3. Extending the WMMA → MFMA lowering to take BOTH v186-193 AND
+     v194-201 as a 16-VGPR A input; this requires lifting the
+     WMMA intrinsic call to consume a `<32 x half>` (or two
+     `<16 x half>` values), which is a raiser-level change not
+     currently in scope.
+
+Session-5's debug instrumentation code lives at `/tmp/instrument.py`
+(text-patch the lifted IR) and `/tmp/matmul_test.cpp` (host harness
+with modes 7/8/9/10 added).  These should be reimplemented as a
+proper `wmma_fragment_decode` lit-test fixture when this
+investigation resumes.
+
 ## 13. Relationship to other axes
 
 - **SPE / wave-size** (`wave-size-translation.md`): WMMA sites require uniform
