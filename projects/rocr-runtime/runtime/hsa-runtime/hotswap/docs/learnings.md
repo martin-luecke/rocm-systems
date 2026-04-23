@@ -153,22 +153,39 @@ drift, not a second miscompile class:
     "non-associative bf16 reduction-order drift, NOT a
     miscompile".
   * `topk_forward_bisect_m2_strict` max|err| dropped from
-    1.48 → 0.53 and 5.9x fewer mismatched rows.  The max
-    residual (0.53 at magnitude 3.875) is ~34 bf16 ULPs
-    which is above the log2(32) reduction bound, but
-    consistent with a tie-break-flip on near-equal bf16 sort
-    keys; the m2 variant with `rel-rms(0.15)` accepting the
-    same output pins that the SET of top-k values is correct
-    even when the exact sorted ORDER near the k/k+1 boundary
-    differs.
+    1.48 → 0.53 and 5.9× fewer mismatched rows.  Deeper
+    classification on the 263 remaining error rows shows a
+    SECOND residual bug class that is NOT bf16 drift:
+      - k=0 (top-1) NEVER mismatches (0/512).  Salmon
+        reliably finds the row-max.
+      - k=1/2/3 mismatch rates scale monotonically: 16, 78,
+        169 rows.
+      - ALL 171 error rows (k≥1 any-position) have DIFFERENT
+        top-k VALUE SETS between salmon and native, not just
+        reorderings.  Zero rows match the "same-SET different-
+        order" tie-break signature.
+      - In 137/171 different-SET rows, salmon DROPS a LARGER
+        value than it added (algorithmic miss).  Only 31/137
+        are within ~1 bf16 ULP of the boundary; the remaining
+        106 drop values 0.05–0.5 larger than substitutions —
+        real algorithmic loss.
+      - Odd-row clustering (all error rows at `row_idx & 1 ==
+        1`) suggests lane-parity interaction in
+        `streaming_topk`'s iterative merge across
+        N_EXPTS_PAD / BLOCK_N peer groups, NOT the cross-16
+        bitonic merge this commit fixes.
+    This matches the 2026-04-22 `_topk_forward` Yi open-
+    finding hypothesis list (u32 value+index packing under
+    cross-widening, `-inf` poisoning of out-of-range lanes,
+    mask carry across merge iterations).  The new datum — k=0
+    reliable, k=3 most-wrong — narrows to the merge/exclude
+    step that produces k=1..3, not the max reduction itself.
 
 The remaining WRONG verdicts on strict-comparator compound
 recipes stay bit-exact-WRONG by design — same precedent as
 `topk_forward_bisect_m1` random was left at WRONG 1300/2048 to
 keep the regression surface bit-exact.  Relaxing the comparator
-to a tight `rel-rms` or widening to ~2 bf16 ULPs `abs` would
-graduate them but hide the non-associative drift signal from
-future regressions.
+would hide the real streaming-merge bug documented above.
 
 **`canary_tl_sort_fp32_n16` is orthogonal** — it uses BLOCK_N=16,
 no cross-16 merge required, zero `v_permlane16_swap_b32` in its
