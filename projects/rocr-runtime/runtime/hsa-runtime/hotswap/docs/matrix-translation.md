@@ -1243,6 +1243,57 @@ with modes 7/8/9/10 added).  These should be reimplemented as a
 proper `wmma_fragment_decode` lit-test fixture when this
 investigation resumes.
 
+### 12.4.5 Session-6 refusal-gate narrowing (2026-04-23)
+
+The Session-5 refusal gate was too broad: it blocked the K=32/K=64
+WMMA→MFMA lowering for EVERY MODREP kernel, even single-WMMA-per-K-
+iter kernels like `matmul_fp16_16x16` whose lowering the rest of
+this document's analysis validates.  compare_correctness confirms
+`matmul_fp16_16x16` produces 5/5 `match` output with the gate off
+(see `tools/compare_correctness/RESULTS.md`) — the gate was a
+false-positive refusal on that corpus recipe.
+
+The root cause of `matmul_fp16`'s remaining wrongness is specific to
+the MULTI-WMMA-per-K-iter regime: when Triton emits 4 WMMAs sharing
+operand halves (v186-193 and v194-201 combined form the full 32-K
+A matrix), the raiser's single-WMMA-intrinsic model can only see
+one 8-VGPR range per WMMA, losing the other half of K.  The
+structural marker of this regime is a `v_permlane16_swap_b32`
+emission Triton uses to bridge the cross-half fragment layout.
+Single-WMMA kernels never emit this opcode.
+
+**Narrowed gate** (2026-04-23):
+
+  * `raiser.cpp` pre-scans the decoded instruction stream once and
+    sets `RaiseContext::kernelHasPermlane16Swap` if any
+    `V_PERMLANE16_SWAP_B32` is present.
+  * `handle_valu_vop3p.cpp`'s K=32/K=64 (and K=4 f32) WMMA→MFMA
+    refusal gates now require BOTH
+    `!projection.providesFullWaveExecInvariant()` (MODREP) AND
+    `ctx.kernelHasPermlane16Swap` (multi-WMMA marker) to refuse.
+  * Single-WMMA-per-K-iter kernels under MODREP now lift through
+    the validated `emitWMMAtoMFMA` / `emitWMMAtoMFMA_F32_16x16x4`
+    paths instead of refusing.
+  * Multi-WMMA-per-K-iter kernels still refuse loudly with the
+    §12.4.4 root-cause citation.
+
+**Lit fixture updates** that fell out of the narrowing:
+
+  * `lit_tests/wmma_phantom_lane_refuse/wmma_phantom_lane_refuse.ll`
+    — rewritten from `%not`-refusal CHECKs to affirmative
+    CHECKs on the emitted MFMA K=4 f32 call + `strict.wwm` wrap
+    (the kernel has no `permlane16_swap`, so the surgical gate
+    correctly lets it through).
+  * `lit_tests/wmma_phantom_lane_f16_chain/wmma_phantom_lane_f16_chain.ll`
+    — rewritten similarly to pin the 2-WMMA-chain K=32 f16 IR
+    shape (MFMA call + strict.wwm + collect bpermute).
+
+The still-broken `matmul_fp16` path's fix is the same open set
+enumerated in §12.4.4 above (decode WMMA.A ISA layout, re-lift
+permlane16_swap, or raise a 16-VGPR `<32 x half>` A input); the
+narrowed gate just stops collateral damage to kernels that aren't
+actually affected by that investigation.
+
 ## 13. Relationship to other axes
 
 - **SPE / wave-size** (`wave-size-translation.md`): WMMA sites require uniform
