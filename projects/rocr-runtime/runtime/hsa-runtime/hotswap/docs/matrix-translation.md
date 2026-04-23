@@ -1294,6 +1294,111 @@ permlane16_swap, or raise a 16-VGPR `<32 x half>` A input); the
 narrowed gate just stops collateral damage to kernels that aren't
 actually affected by that investigation.
 
+### 12.4.6 Session-7 layout investigation — where we got stuck (2026-04-23)
+
+A follow-on investigation against Triton's WMMA lowering
+(`third_party/amd/lib/TritonAMDGPUToLLVM/DotOpToLLVM/WMMA.cpp`,
+`lib/Dialect/TritonGPU/IR/LinearLayoutConversions.cpp::wmmaDotOperandToLinearLayout`
+and the `AMDWmmaEncodingAttr` doc in
+`TritonGPUAttrDefs.td`) plus pre-swap `v_permlane16_swap_b32`
+instrumentation pinned down three additional structural facts.
+They close some doors but don't yet open the fix:
+
+**Fact 1 — the `isTransposed` operand swap is real.** For
+`version=3 isTransposed=true` (matmul_fp16's layout)
+`generateWMMAOp` calls `wmma(hb, ha, ...)`, i.e. the WMMA.A
+intrinsic operand slot receives Triton's B tensor data (`hb`) and
+the WMMA.B slot receives Triton's A data (`ha`).  Per-thread
+data-flow:
+
+  * `ha` (WMMA.B slot, v170-177 in matmul_fp16): Triton.A values.
+  * `hb` (WMMA.A slot, v186-193 in matmul_fp16): Triton.B values.
+
+The WMMA instruction therefore computes
+`D_wmma = hb × ha = Triton.B × Triton.A = (Triton.A × Triton.B)^T`
+and Triton stores `D` with the matching transposed output
+encoding.
+
+**Fact 2 — per-operand LinearLayout differs for A vs B.** The
+`wmmaDotOperandToLinearLayout` body is the same for both opIdx,
+but `dimK` and `dimNonK` swap positions based on `getOpIdx()`.
+Observed on matmul_fp16 with `kWidth=16`, `depth=2`, `nonKDim=16`:
+
+  Operand A (v170-177, ha):
+    lane L, register r → A[M = L%16,
+                           K = (r & 7) + 16*((r>>3)&1) + 8*((L>>4)&1)]
+  — lane bit 4 shifts K by 8 (the doc's "depth offsets K"
+  interpretation); register bit 3 shifts K by 16 (the "kWidth"
+  offset that makes register 8..15 span the upper K half).
+
+  Operand B PRE-swap (v186-193 pre-v_permlane16_swap):
+    lane L, register r → B[N = L%16 + 16*((L>>4)&1),
+                           K = (r & 7) + 16*((r>>3)&1)]
+  — lane bit 4 shifts **N** by 16 (not K); register bit 3 shifts
+  K by 16.  So A's and B's per-lane layouts are NOT mirror
+  images — they diverge at the lane-bit-4 contribution.
+
+**Fact 3 — POST-swap v186-193 holds HALF of K, not full.** The
+`v_permlane16_swap_b32 v186, v194` cross-wires (lanes 0-15 v186)
+↔ (lanes 16-31 v194) and vice-versa, leaving post-swap v186-193
+with only the K subset that pre-swap v194-201 held (K ∈ {8-15,
+24-31}).  The other K subset (K ∈ {0-7, 16-23}) stays in
+post-swap v194-201.  Combined across the four WMMA calls:
+
+  * WMMA1 (A=v186, B=v170): K={8-15, 24-31} partial product.
+  * WMMA2 (A=v194, B=v170): K={0-7, 16-23} partial product.
+  * WMMA3 (A=v186, B=v178): K={8-15, 24-31} partial product.
+  * WMMA4 (A=v194, B=v178): K={0-7, 16-23} partial product.
+
+**The structural barrier.** Given only 8 VGPRs (v186-193) enter
+the WMMA.A operand slot per call, and those 8 VGPRs hold only
+half of K, a per-WMMA-independent MFMA lowering CANNOT reconstruct
+the full K sum from a single WMMA intrinsic call's data — the
+missing K data lives in a sibling register range (v194-201) that
+the single-intrinsic lowering model doesn't see.  The four
+accumulators (v[2:9], v[10:17], v[18:25], v[26:33]) go to
+different output regions in Triton's epilogue, so the
+"WMMA1+WMMA2 go to the same sub-tile accumulator" collapse that
+would let the MFMA lowering stay per-WMMA doesn't happen either.
+
+**Paths forward, in order of how principled they are:**
+
+  1. **Raiser-level 4-WMMA-pattern recognition (principled,
+     expensive).**  Teach `raiser.cpp` to detect the quad-WMMA
+     fragment-shuffle idiom (= `v_permlane16_swap_b32` → 4 back-
+     to-back WMMAs sharing operand register ranges) and emit a
+     single `<32 x half>` A operand tensor into the WMMA
+     lowering.  The MFMA redistribution then has access to both
+     K halves (v186-v201 combined) and can produce the full K
+     sum.  Requires a new pre-raise phase and a second WMMA
+     intrinsic variant that consumes 16 VGPRs per-lane A; non-
+     trivial and touches the lift structure beyond `wmma_lowering.cpp`.
+
+  2. **Pre-swap instrumentation + raise the PRE-swap vregs
+     instead (cheaper, loses register-reuse).** Re-lift the four
+     WMMA calls to consume PRE-permlane16_swap register ranges
+     (v186-193 pre-swap has the standard DotOperand layout that
+     `redistributeInput` already handles correctly).  This would
+     keep the lowering mostly unchanged but loses the register
+     coalescing Triton's post-swap gets, and requires the
+     `v_permlane16_swap_b32` lift to not-destructively rewrite
+     the post-swap vregs.
+
+  3. **Decode gfx1250 WMMA.A ISA layout from hardware (ideal,
+     needs ISA-spec access).**  If the AMD gfx1250 ISA spec
+     documents the exact per-lane (M, K) ↔ (lane, register)
+     mapping for `v_wmma_f32_16x16x32_f16`, we can write the
+     correct post-swap `redistributeInput_A` that accounts for
+     the layout asymmetry and skips the 16-VGPR raiser change.
+     Not currently accessible from our side.
+
+Session 7 verified empirically that my Session-5 `redistributeInput`
+swap (LG1/LG2 interchange) IS correct for operand A (mode 7 /
+mode 9 confirm) but INCORRECT for operand B under the post-swap
+layout above — because the single-register-set assumption breaks
+down.  The experimental fix was reverted.  The narrowed refusal
+gate from §12.4.5 remains the principled outcome.
+
 ## 13. Relationship to other axes
 
 - **SPE / wave-size** (`wave-size-translation.md`): WMMA sites require uniform
