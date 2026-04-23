@@ -8,6 +8,115 @@ Append-only. Newest on top.
 
 ---
 
+## 2026-04-23 — V_CMP wave-mask shadow propagation through scalar ops (closes canary_tl_sort_fp32_n4)
+
+`canary_tl_sort_fp32_n4` graduates from WRONG 775/2048 to
+`match` through two commits that extend the matmul128x128-class
+`WaveMaskEntry` shadow cache (da404faf84, 2026-04-21) from its
+original "V_CMP → V_CNDMASK in same BB, no intervening scalar
+write" scope to also cover scalar-op-interleaved patterns that
+Triton's gfx1250 codegen emits at the cross-widened bitonic
+compare-and-swap.
+
+**Stage 1 — scalar XOR/AND/OR between V_CMPs
+(`s_{and,or,xor}_b32` + SGPR sources).**
+Triton's n=4 sort direction mask is:
+
+  v_cmp_ngt_f32_e64 s2, v3, v5    ; per-lane (v3 <= partner)
+  v_cmp_eq_u32_e64  s3, 1, v4     ; lane-parity bit
+  s_xor_b32 s2, s2, s3            ; direction = ngt XOR parity
+  v_cndmask_b32 v3, v5, v3, s2    ; v3 = s2 ? v3 : v5
+
+Under wave32 source → wave64 target, the pre-fix shadow cache
+tracked each V_CMP's wave-width i1 (64 bits) across the narrow
+(32-bit) SGPR write, so V_CNDMASK could read the full i1
+directly.  But `s_xor_b32 s2, s2, s3` is a scalar write that
+INVALIDATES the cache for s2.  The subsequent V_CNDMASK then
+took the lossy narrow-mask fallback (replicate low-32 to
+both halves), mis-routing the upper 32 target lanes.
+
+Fix: propagate wave-width i1 through S_{AND,OR,XOR}_B32 when
+BOTH sources have cached i1.  Compute `dst_i1 = src0_i1 OP
+src1_i1` per-lane and re-record the shadow after the scalar
+write's invalidation.  Graduated the BLOCK_N=4 sort WRONG
+775/2048 → 498/2048 (−35.7%).
+
+**Stage 2 — VCC/EXEC sources and VCC destination.**
+The n=4 sort's second and third compare-and-swap idioms use
+VCC and the saveexec→xor pattern.  Three additional
+participant register kinds were added to both
+`tryGetSrcWaveMaskI1` (sources) and `recordDerivedWaveMaskI1`
+(destinations):
+
+  * **VCC source** — `loadVCC` yields the per-lane i1 directly
+    (VCC alloca stores i1, not a wave-width mask).
+  * **EXEC source** — `extractLaneBitFromWaveMask(loadExec())`
+    yields the per-lane i1 from the i64 EXEC alloca.
+  * **VCC destination** — when both sources have wave-width i1,
+    overwrite the VCC alloca's i1 with the correct per-lane
+    XOR/AND/OR (bypassing the lossy i32
+    extract-lane-bit-from-replicate path `writeReg32(VCC, i32)`
+    otherwise uses).
+
+**Stage 3 — `s_{and,or,xor,andn2,orn2}_saveexec_b32` record
+dst SGPR shadow with the per-lane i1 of OLD EXEC.**  The
+saveexec family saves the full-width `oldExec` to a source-
+width SGPR (lossy under cross-widening).  The handlers already
+have the i64 oldExec in hand; after `writeRegExecWidth` fires
+the shadow invalidation via `onSgprWritten`, re-record the
+dst SGPR shadow with `extractLaneBitFromWaveMask(oldExec)`.
+Covers the "else-branch mask" idiom `s_and_saveexec_b32 sN,
+vcc; s_xor_b32 sN, exec_lo, sN` Triton emits between bitonic
+stages.
+
+Combined, the three extensions close n=4 fully: WRONG 498 →
+match.  The matmul128x128-class shadow cache's invariants
+(I1 additive, I2 SSA-monotonic within a BB, I3 any
+interference defeats the cache, see sgpr-wave-mask-translation
+.md §3.1) are preserved — the propagation only ADDS shadow
+entries; it never masks the narrow-mask fallback when the
+wave-width info isn't actually available.
+
+**Residuals open (distinct bug classes).**
+
+  * `canary_tl_sort_fp32_n16` (WRONG 1056/8192, 12.9%): uses
+    a different code shape — direction XOR happens on
+    MATERIALIZED VGPR bits (`v_cndmask → vGPR → v_cmp_eq_u32
+    s0, v17, v_materialized`) rather than via scalar
+    s_xor_b32.  The shadow cache is keyed on SGPR V_CMP
+    writers; materialising to a VGPR and then comparing VGPRs
+    puts the per-lane i1 back in SSA at the correct
+    wave-width naturally, so there's no narrow-mask fallback
+    at the compare-and-swap.  The structural error pattern
+    (rows 18/19/22/23/26/27/30/31 mod 32, warps 2/3
+    thread-slots 8-15/24-31) does NOT match what a
+    shadow-cache residual would produce.  Open for a
+    dedicated bisect; four diagnostic probes
+    (`canary_tl_sort_fp32_n16_{deterministic,xor1,
+    row_offset,altrow}`) pin the value-dependence.
+  * `topk_forward_bisect_m2_strict` (WRONG 263/2048):
+    streaming_topk merge-step bug (k=0 always match, k=1/2/3
+    scale-up, different VALUE SETS).  Independent of tl.sort
+    primitive correctness.
+  * `topk_forward_bf16` (WRONG 670/8192): `_topk_forward` Yi
+    index-set divergence, pre-existing open finding from
+    2026-04-22; current fix reduces it from 2856/8192 to
+    670/8192 (76% reduction) but can't close because the
+    remaining divergence is in streaming_topk's merge step.
+
+**Precedent-setting reference.**  The matmul128x128 shadow
+cache treated the "V_CMP wave-width i1 cached, SGPR-narrow
+path bypassed" invariant as additive at the V_CNDMASK
+consumer.  This session's extensions are the first that
+propagate the i1 THROUGH intermediate scalar ops
+(s_{and,or,xor}_b32, s_*_saveexec_b32) and treat VCC/EXEC as
+additional wave-width-carrying participant register kinds.
+All three extensions remain compatible with the original
+invariants (the shadow is additive — its absence takes the
+pre-existing lossy path).
+
+---
+
 ## 2026-04-23 — Triton gfx1250 permlane16_swap self-preserving rewrite (TRANSITIONAL)
 
 `canary_tl_sort_fp32`, `canary_tl_topk_fp32`, `canary_tl_topk_bf16`,
