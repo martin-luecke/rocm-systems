@@ -923,6 +923,47 @@ bytes at launch per the Triton sidecar), so my fix does not
 affect its KD.  The matmul_fp16 multi-WMMA residual documented
 in §12.4 persists after this fix — it's a separate bug.
 
+### 12.4.3 Session-4 per-cell characterization (2026-04-22)
+
+Pinned the mode-5 error pattern to a PRECISE bit-level shape:
+
+  * For ALL rows i and cols j, got[i, j] = 2*(j mod 16) + 16.
+  * All 32 rows of the 32×32 output are IDENTICAL (which is
+    correct for mode 5 since A=1s makes output lane-independent).
+  * Both sub-tile WMMAs (WMMA(0,0) writing cols 0..15 and
+    WMMA(0,1) writing cols 16..31) produce the SAME per-cell
+    value at matching col_local — i.e., got[i, j_local] ==
+    got[i, j_local+16] for every j_local in [0,16).
+
+This mathematically constrains the bug to: "BOTH WMMAs receive
+B fragment starting at B matrix col 8 (not B col 0 and B col 16
+respectively)."  Proof: mode-5 B[k, j] = j/16.  If the MFMA
+K=32 aggregate = K * B_val, observed K*B_val per cell = 2*col_local
++ 16.  Solving: B_val = col_local/16 + 0.5 = (col_local+8)/16.
+That's B[k, col_local+8] — a +8-column shift from the expected
+fragment-start.
+
+The +8 col shift is UNIFORM across BOTH sub-tile WMMAs.  That
+rules out a per-WMMA fragment-indexing bug (which would shift
+sub-tile 0 and sub-tile 1 independently) and localises the
+corruption to a step SHARED between the two WMMAs — most
+plausibly the LDS round-trip (writes originate in a single
+`ds_store_b16` sweep both WMMAs' B data shares) OR the B-fragment
+redistribute pre-sharing across the two WMMAs.
+
+**Next investigation step**: add a debug `global_store` of
+v[170] and v[178] (the first dwords of B fragments for WMMA(0,0)
+and WMMA(0,1) respectively) right after the source's
+`ds_load_b128` that populates them.  For mode 5 with correct
+lifting, source-active lane 0's v[170] should hold B[k, 0..3]
+fp16 values = {0, 1/16, 2/16, 3/16} and v[178] should hold
+B[k, 16..19] = {16/16, 17/16, 18/16, 19/16}.  If instead both
+v[170] and v[178] hold {8/16, 9/16, 10/16, 11/16}, the LDS
+round-trip confirms the "+8 col shift" origin and the bug is
+in the load→LDS→read path, not in the WMMA lift.  Otherwise
+the shift happens post-LDS in one of the redistribute /
+permlane16_swap / MFMA steps.
+
 ### 12.4.2 Session-3 synthetic bisection (2026-04-22)
 
 Built a set of bisection repros to isolate `matmul_fp16`'s residual
