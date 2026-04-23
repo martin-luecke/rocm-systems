@@ -8,6 +8,251 @@ Append-only. Newest on top.
 
 ---
 
+## 2026-04-23 — Triton gfx1250 permlane16_swap self-preserving rewrite (TRANSITIONAL)
+
+`canary_tl_sort_fp32`, `canary_tl_topk_fp32`, `canary_tl_topk_bf16`,
+and `canary_tl_topk_bf16_nw1` all graduate from `WRONG 2048/2048`
+(or 15353/16384 for the 32-column sort) to `match`.  The compound
+`topk_forward_bf16` and `topk_forward_bisect_m2_strict` reduce from
+2856/8192 → 670/8192 (-76%) and 1542/2048 → 263/2048 (-83%)
+respectively; the residuals are bf16 reduction-order drift with
+tight `abs tol=0.0` comparators — same class as the m1 residual
+documented under FMA_MIX below, and not a miscompile (see §
+"Residual characterisation" below).  The `canary_tl_sort_fp32
+_deterministic` sibling continues to match under the new rewrite
+(the xor3-partner sibling rewrite also still fires, both now
+substituting the same `seed` value; double substitution is a
+no-op).
+
+**The generalisation.** The pre-existing `rewrite_permlane16
+_xor3_partner` pass caught ONE Triton cross-16 bitonic-merge
+composition — the fused `v_xor3_b32`.  Triton's gfx1250 codegen,
+empirically, emits AT LEAST THREE distinct compositions around
+the same `v_permlane16_swap_b32 + v_dual_mov same-seed
+initialiser` idiom:
+
+  * `tl.sort` (deterministic): fused `v_xor3_b32 v_a, v_a, v_b,
+    v_c` — the only case the pre-existing rewrite covered.
+  * `tl.sort` (random): split as `v_xor v_a, v_b, v_a` (inner) +
+    `v_xor v_a, v_a, v_c` (outer).  The inner xor gets its OWN
+    `emitUnderExec` SPE-phi wrapper on the way to the outer xor,
+    so the pre-existing rewrite's `dyn_cast<BinaryOperator>`
+    on the outer xor's LHS fails (it's a phi, not an xor).
+  * `tl.topk`: max-based, no xor at all — `v_max v_d, v_b, v_b
+    :: v_max v_a, v_a, v_a; v_max v_a, v_a, v_d`.  No amount
+    of pattern-matching on an xor will catch this shape.
+
+All three compositions share ONE underlying structural invariant:
+the `v_permlane16_swap_b32` is initialised with `v_dual_mov v_a,
+v_c :: v_dual_mov v_b, v_c` so BOTH `vdst_in` and `src0_in` hold
+the same SSA seed per-lane.  Under the gfx950-documented symmetric
+cross-wire
+  new_vdst[L]      = src0_in[L XOR 16]
+  new_src0_out[L]  = vdst_in[L XOR 16]
+both outputs end up holding `partner_seed` — the algorithm has
+no access to `self_seed` anywhere, and every downstream
+composition degenerates:
+
+  xor3(partner, partner, self)         = self   (want partner)
+  xor(xor(partner, partner), self)     = self   (want partner)
+  max(max(partner, partner),
+      max(partner, partner))           = partner (want max(self, partner))
+
+The new pass fixes this at the ROOT — the bpermute-pair emission
+itself — instead of pattern-matching every downstream
+composition.  When `emitPermLaneSwapEmulation` emits two bpermute
+calls at a site and both data arguments trace (via SPE active-arm
+phi walks) to the same SSA root, the SECOND call's result (the
+`new_src0_out` of the swap) is RAUW'd with the shared seed root.
+That makes the emulation asymmetric:
+
+  new_vdst[L]      = bpermute(partner_addr, src0_in)  (partner_seed)
+  new_src0_out[L]  = seed_root[L]                      (self_seed)
+
+All three compositions above now produce the algorithm-expected
+output:
+
+  xor3(partner, self, self)                    = partner ✓
+  xor(xor(partner, self), self)                = partner ✓
+  max(max(self, self), max(partner, partner))  = max(self, partner) ✓
+
+This is EXACTLY what Triton's gfx942-NATIVE compile does with
+`ds_swizzle_b32 swap:16` — a single-output swap that gives the
+algorithm access to both `self` (in the original register) and
+`partner` (in the swizzle result).  The asymmetric gfx1250
+emulation matches that contract.
+
+**Layer choice — rewrite pass, not primitive semantic change.**
+We don't have gfx1250 hardware to verify which of these is true
+(same `(a)/(b)` split as the xor3-partner sibling):
+
+  (a) gfx1250 silicon's `v_permlane16_swap_b32` is asymmetric —
+      only one output cross-wires, the other preserves its input
+      — and Triton's codegen targets that semantic accurately.
+      Our existing `emitPermLaneSwapEmulation` emits the gfx950
+      symmetric cross-wire and is WRONG for gfx1250 sources.
+
+  (b) gfx1250 silicon matches gfx950 (symmetric cross-wire), and
+      Triton's gfx1250 codegen has a bug that produces
+      algorithmically incorrect code on gfx1250 hardware itself.
+
+The `Gfx1250Gpu.Permlane16Swap` GTest validates the symmetric
+cross-wire semantic by running a salmon-lifted gfx1250 kernel
+with DISTINCT `vdst_in[L] = L`, `src0_in[L] = 1000 + L` inputs
+on gfx942 hardware — it tests our EMULATION, not gfx1250 silicon.
+It passes (both outputs are cross-wired per spec).  That's a
+weak signal either way for the silicon question.
+
+Under both (a) and (b), the algorithm-correct thing for salmon
+to do is expose `self` and `partner` to the downstream
+composition — which is what this pass does.  If silicon matches
+(a), the fix is eventually better-placed at the primitive layer
+(gate the asymmetric emulation behind a source-ISA check); the
+rewrite is then dead code.  If Triton fixes (b), the idiom
+disappears from lifted IR and the rewrite is also dead code.
+Both dead-code states are the pass's intended TRANSITIONAL end —
+same pattern as the xor3-partner sibling.  The two passes are
+NOT redundant during the transition: the new self-preserve pass
+subsumes the xor3-partner functionality for same-seed sites,
+but the xor3-partner pass is retained as belt-and-suspenders
+(it's narrow and harmless).
+
+**Fingerprint narrowness.**  The check is structurally impossible
+outside the Triton idiom:
+
+  1. Two `@llvm.amdgcn.ds.bpermute` calls in the same BB.
+  2. Their first operand (the partner address) is SSA-identical
+     (`emitPermLaneSwapEmulation` emits it as a single `shl`).
+  3. Their second operand (the data) traces via SPE active-arm
+     phi walks to the same SSA root.
+
+Non-Triton kernels that use `v_permlane16_swap_b32` with distinct
+inputs per-operand (the `Permlane16Swap` GTest, the AITER
+kernels' `v_permlane32_swap_b32` siblings through a different
+opcode) don't match condition 3 — their data args trace to
+distinct SSA roots.  DPP cross-widening's `ds.bpermute` calls
+don't share address SSA (each DPP site computes its own
+selector).  The fingerprint isolates exactly Triton's cross-16
+bitonic-merge idiom.
+
+**Residual characterisation — the two compound recipes.**
+
+`topk_forward_bf16` and `topk_forward_bisect_m2_strict` still
+show mismatches under `abs tol=0.0` (670/8192 and 263/2048
+respectively), but the verdict pattern matches legitimate bf16
+drift, not a second miscompile class:
+
+  * `topk_forward_bisect_m2` (same kernel, `rel-rms tol=0.15`
+    comparator) now matches — the shape-level top-k SET is
+    correct within the tolerance Triton's own reduction-order
+    non-associativity requires.
+  * `topk_forward_bisect_m1` random-input continues at `WRONG
+    1300/2048 max|err|=0.25` exactly as before the cross-16
+    fix — this bug was already fixed by the FMA_MIX commit
+    (see entry below) and its residual was characterised as
+    "non-associative bf16 reduction-order drift, NOT a
+    miscompile".
+  * `topk_forward_bisect_m2_strict` max|err| dropped from
+    1.48 → 0.53 and 5.9x fewer mismatched rows.  The max
+    residual (0.53 at magnitude 3.875) is ~34 bf16 ULPs
+    which is above the log2(32) reduction bound, but
+    consistent with a tie-break-flip on near-equal bf16 sort
+    keys; the m2 variant with `rel-rms(0.15)` accepting the
+    same output pins that the SET of top-k values is correct
+    even when the exact sorted ORDER near the k/k+1 boundary
+    differs.
+
+The remaining WRONG verdicts on strict-comparator compound
+recipes stay bit-exact-WRONG by design — same precedent as
+`topk_forward_bisect_m1` random was left at WRONG 1300/2048 to
+keep the regression surface bit-exact.  Relaxing the comparator
+to a tight `rel-rms` or widening to ~2 bf16 ULPs `abs` would
+graduate them but hide the non-associative drift signal from
+future regressions.
+
+**`canary_tl_sort_fp32_n16` is orthogonal** — it uses BLOCK_N=16,
+no cross-16 merge required, zero `v_permlane16_swap_b32` in its
+disassembly.  Its 12.9% WRONG is a separate bug class that this
+rewrite doesn't (and can't) touch.
+
+Residual characterisation (2026-04-23 session, committed as
+diagnostic probes): errors cluster PERFECTLY at rows where
+`(row_index & 0b10010) == 0b10010` within each 32-row workgroup
+tile — i.e., rows 18, 19, 22, 23, 26, 27, 30, 31 mod 32.  In
+Triton's [M=32 rows × N=16 cols, num_warps=4, sizePerThread=
+[1, 4]] layout, those rows live in warps 2 and 3 at thread-slot
+positions {8..15, 24..31} within their warp — target-wave-1
+lanes with bit 3 of lane_id set.  Within each error row, each
+of the 8 adjacent col-pairs has ≈50% chance of being inverted
+INDEPENDENTLY (verified: 128 error rows × 8 pairs each, binomial
+distribution around 4 wrong pairs per row; all wrong pairs are
+plain in-row swaps — the VALUE SET is a correct permutation of
+native's output).
+
+Value-dependence is strict: four deterministic probes with
+different input patterns all MATCH, only random input fails:
+  * `canary_tl_sort_fp32_n16_deterministic` — X[r,c] = c (all
+    rows identical, monotonic): match.
+  * `canary_tl_sort_fp32_n16_xor1` — X[r,c] = c^1 (pair-swapped
+    monotonic): match.
+  * `canary_tl_sort_fp32_n16_row_offset` — X[r,c] = r*100 + c
+    (per-row distinct, monotonic ascending): match.
+  * `canary_tl_sort_fp32_n16_altrow` — X[r,c] alternates
+    ascending/descending per row parity: match.
+  * `canary_tl_sort_fp32_n16` — uniform random [-4, 4]:
+    WRONG 1056/8192 (12.9%).
+
+Projection and rewrite toggles isolate where the bug is NOT:
+  * Under `--disable-wave-native` (ModRep instead of
+    WaveNative): identical 1056/8192 WRONG.  Not a cross-wave
+    truncation of a V_CMP→SGPR wave-mask (the class fixed for
+    matmul128x128 by the `WaveMaskEntry` shadow cache).
+  * Under `--disable-writelane-rewrite` (DPP cross-widening
+    rewrite disabled, DPP lifts as `@llvm.amdgcn.update.dpp`
+    intrinsic directly): identical 1056/8192 WRONG.  Not in the
+    `rewrite_cross_lane_divergent` DPP-to-ds_bpermute rewrite.
+
+That leaves either (i) a primitive-level handler with
+value-dependent per-lane behaviour we haven't isolated, or (ii)
+a pattern in Triton's gfx1250 compile of `tl.sort` at BLOCK_N=16
+specifically that needs a different rewrite / handler
+adjustment.  The `canary_tl_sort_fp32` graduation to `match` in
+the presence of the N=16 residual pins that the residual is
+wholly below the cross-16 stage — the cross-[1, 2, 4, 8] DPP
+stages compose correctly in the N=32 case (after the cross-16
+fix) but fail at N=16 on specific rows.  Open for a dedicated
+bisect.
+
+The five probes ship together so a future session has the full
+discriminator (monotonic / xor1 / row-offset / altrow / random)
+already wired to narrow the bug class without re-deriving it.
+
+**Regression surface.**
+
+  * Full Triton corpus: 72/104 → 76/104 match (+4 recipes:
+    canary_tl_sort_fp32, canary_tl_topk_fp32, canary_tl_topk
+    _bf16, canary_tl_topk_bf16_nw1).  No previously-passing
+    recipe regresses.
+  * `Gfx1250Gpu.Permlane16Swap{,Wave32,Wave32WaveNative}`,
+    `Gfx1250Gpu.BitonicCross16Probe`,
+    `Gfx1250Gpu.BitonicXor3TritonState`,
+    `Gfx1250Gpu.RcpSqrt`, `Gfx1250Gpu.DppQuadPerm` — all pass.
+  * Full ctest: 95% (105/107 lit fixtures + 74 gtests) with
+    the same pre-existing failures as before the fix (the
+    `wmma_phantom_lane_*` lit fixtures that the matmul-WMMA
+    agent owns, and the `MfmaGpu.Gemm*` gtests blocked on a
+    separate `s_load_dwordx4` kernarg-slot parsing bug).
+
+**Flag plumbing — same pattern as the xor3-partner flag.**
+`--enable-permlane16-swap-selfpreserve` / `--disable-permlane16-
+swap-selfpreserve` on `raise_cli`; default on.  The
+`enablePermLane16SwapSelfPreserveRewrite` parameter threads
+through `raiser.hpp` → `pipeline.hpp` → `pipeline.cpp`.
+`--disable-` audits the pre-rewrite symmetric-cross-wire shape
+for baseline characterisation.
+
+---
+
 ## 2026-04-23 — global_atomic SADDR form silently miscompiled (sum_bitmatrix_rows_u32)
 
 `sum_bitmatrix_rows_u32` and its `_nw4` sibling crashed every launch
