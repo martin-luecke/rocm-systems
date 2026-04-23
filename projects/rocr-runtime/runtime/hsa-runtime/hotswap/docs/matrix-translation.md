@@ -923,6 +923,84 @@ bytes at launch per the Triton sidecar), so my fix does not
 affect its KD.  The matmul_fp16 multi-WMMA residual documented
 in §12.4 persists after this fix — it's a separate bug.
 
+### 12.4.2 Session-3 synthetic bisection (2026-04-22)
+
+Built a set of bisection repros to isolate `matmul_fp16`'s residual
+from its structural confounders.  All repros use
+`__launch_bounds__(32)` so they're in the same MODREP phantom-lane
+regime as `matmul_fp16`, and the test harness
+(`/tmp/repro_test.cpp`) compares each quad-WMMA kernel's output
+slot-by-slot against a single-WMMA kernel fed the same inputs.
+Identical inputs to the same WMMA intrinsic MUST yield identical
+outputs; any slot divergence indicates a lift bug.
+
+| Repro                                     | Structure                                             | Mode 0 | Mode 5 |
+|-------------------------------------------|-------------------------------------------------------|--------|--------|
+| `single_wmma_X`                           | 1 WMMA, per-lane global load, no LDS, no swap         | baseline | baseline |
+| `quad_wmma_X`                             | 4 parallel WMMAs, shared A and B operand vregs        | 0/256  | 0/256  |
+| `quad_wmma_swap`                          | 4 parallel WMMAs + 8 `v_permlane16_swap_b32` on A     | 0/256  | 0/256  |
+| `quad_wmma_lds`                           | 4 parallel + swap + per-thread-disjoint static LDS    | 0/256† | 0/256† |
+| `quad_wmma_cross_lds_noswap`              | 4 parallel + cross-thread static LDS shuffle          | 0/256‡ | 0/256‡ |
+| `quad_wmma_cross_lds` (with swap)         | 4 parallel + swap + cross-thread static LDS shuffle   | 0/256‡ | 0/256‡ |
+| `quad_wmma_dyn_lds` (with swap, dynamic)  | 4 parallel + swap + cross-thread DYNAMIC LDS shuffle  | 0/256‡ | 0/256‡ |
+| Triton `matmul_fp16_16x16` (BLOCK=16)     | Real kernel, 1 WMMA, dynamic LDS                      | pass   | pass   |
+| **Triton `matmul_fp16` (BLOCK=32)**       | Real kernel, 4 WMMAs, dynamic LDS                     | **pass** | **1024/1024 ✗** |
+
+† LDS round-trip was elided by `-O2` forward-propagation on
+disjoint per-thread slots.
+
+‡ Required the `amdgpu-lds-size` fix (commit `f411ec81b4`) to pass;
+pre-fix these failed because `.group_segment_fixed_size: 0` in the
+lifted HSACO made every LDS access target an unallocated segment
+and return zero.
+
+**Falsified hypotheses** from this matrix:
+
+  * **Multi-WMMA alone**: `quad_wmma_X` passes.  4 parallel WMMAs
+    sharing A and B operand vregs is correctly lifted.
+  * **`v_permlane16_swap_b32` alone**: `quad_wmma_swap` passes.
+    The swap lift + multi-WMMA interaction is fine.
+  * **Cross-thread LDS shuffle alone**: `quad_wmma_cross_lds{,_noswap}`
+    pass post the `amdgpu-lds-size` fix.  The fragment reshuffle
+    via LDS works under MODREP.
+  * **Dynamic LDS**: `quad_wmma_dyn_lds` passes.  Dynamic LDS
+    (via `extern __shared__` + `sharedMemBytes` launch argument)
+    is correctly handled.
+
+`matmul_fp16`'s `got = ref ± 16` per-sub-tile residual persists
+despite EVERY structural component of its pre-WMMA pipeline
+(multi-WMMA, permlane16_swap, cross-thread LDS shuffle, dynamic
+LDS) individually passing as a synthetic.  The residual must
+therefore be in an interaction my synthetics do not exercise:
+
+  * **K-loop accumulator PHI**.  `matmul_fp16`'s four `v[2:9]`,
+    `v[10:17]`, `v[18:25]`, `v[26:33]` accumulator vreg-ranges
+    are loop-carried through a K-loop.  For M=32 / BLOCK_K=32
+    the loop body runs once, but the LIFT builds SSA phi nodes
+    with two incoming values (init 0 and back-edge update).
+    For phantom lanes the init-side of the phi is undef from
+    the (inactive) `spe_skip` path; the WMMA-redistribute that
+    follows reads these phis' first-iteration values under
+    WWM, and if the backend's value-numbering can't prove the
+    back-edge path is dead for lane-uniform data, the MFMA
+    accumulator may observe a phantom-lane-contaminated value.
+  * **`v_dual_mov_b32` / `v_dual_bitop2_b32` VOPD interaction**.
+    `matmul_fp16` heavily uses dual-issue VOPD ops to
+    initialise the accumulator (`v_dual_mov_b32 v3, v2 ::
+    v_dual_mov_b32 v6, v2` pattern, etc.).  The VOPD lift in
+    `handle_vopd.cpp` handles `v_bitop2_b32` correctly (LUT
+    expansion, verified in isolation), but a specific SEQUENCE
+    of VOPD ops that end up in the K-loop body may introduce
+    a subtle data-dependency the backend mishandles.
+  * **Runtime instrumentation is the next step**.  The cleanest
+    way to discriminate between these is to insert a debug
+    `global_store` of the MFMA-1 C operand vector right before
+    the first `mfma.f32.16x16x16f16` call and compare against
+    the expected all-zeros.  If C is NOT zero on source-active
+    lane 0, the accumulator-PHI / VOPD-lift hypotheses are
+    confirmed; if C IS zero, the bug moves downstream of the
+    MFMA itself.
+
 ### 12.4.1 Additional session findings (2026-04-22)
 
 Session 2 ran several directed experiments; the residual is still
