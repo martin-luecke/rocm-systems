@@ -1399,6 +1399,142 @@ layout above — because the single-register-set assumption breaks
 down.  The experimental fix was reverted.  The narrowed refusal
 gate from §12.4.5 remains the principled outcome.
 
+### 12.4.7 Session-8 root cause pinned (2026-04-23)
+
+Session 7 concluded the raiser-level layout work was blocked on
+ISA decoding that wasn't accessible.  The user then made MI400
+Shader Programming Guide excerpts available via
+`hotswap/docs/manuals/`, and the § V_PERMLANE16_SWAP_B32 pragma
+showed the root cause was NOT in `wmma_lowering.cpp` /
+`redistributeInput` at all — it was one layer up, in the
+`v_permlane16_swap_b32` lift itself (`handle_valu_cross_lane.cpp`
+`emitPermLaneSwapEmulation`).
+
+The ISA semantic is **asymmetric**: only lanes 0..15 of `src0`
+get swapped with lanes 16..31 of `vdst`; lanes 16..31 of `src0`
+and lanes 0..15 of `vdst` are **unchanged**.  The pragma pins it
+verbatim:
+
+```
+// Lanes 0:15 of src0 and lanes 16:31 of vdst swapped.
+// Lanes 16:31 of src0 and lanes 0:15 of vdst are unchanged.
+for lane in 0:15 do tmp[lane] = VGPR[lane][SRC0] endfor;
+for lane in 0:15 do
+  if EXEC[lane]:    VGPR[lane][SRC0]  = VGPR[lane+16][VDST]
+  if EXEC[lane+16]: VGPR[lane+16][VDST] = tmp[lane]
+endfor
+```
+
+Our pre-Session-8 emulation was **symmetric** — two cross-wired
+`ds_bpermute` calls that unconditionally swapped both 16-lane
+halves via `lane XOR 16`:
+
+```
+new_vdst     = bpermute(addr, src0)   // all lanes swap
+new_src0_out = bpermute(addr, vdst)   // all lanes swap
+```
+
+That over-swapped the two halves that the ISA says are
+UNCHANGED, corrupting every `matmul_fp16` input position and
+surfacing downstream as the `+16 col shift` / `+4 bias`
+residuals that Sessions 5–7 characterised at the MFMA-
+redistribution layer.  The `redistributeInput` asymmetries those
+sessions documented are **not** the root cause — they are
+correct relative to a correct upstream swap.
+
+**The fix** (see `handle_valu_cross_lane.cpp::
+emitPermLaneSwapEmulation`): compute both partner bpermutes,
+then per-lane `select` on the half-bit `lane AND partnerXorMask`
+to match the ISA's asymmetric per-half semantic:
+
+```
+isLaneLow    = (lane & partnerXorMask) == 0
+new_vdst     = select(isLaneLow, vdst_in,        bperm_src0)
+new_src0_out = select(isLaneLow, bperm_vdst,     src0_in)
+```
+
+**Source-ISA gate (`ctx.isa.isWave32()`).** The asymmetric
+pragma excerpted above is from the MI400 Shader Programming
+Guide, which covers gfx1250 (the only wave32 ISA that exposes
+both `v_permlane16_swap_b32` and `v_permlane32_swap_b32`).
+gfx950 also exposes `v_permlane16_swap_b32`, but we do not
+currently have its ISA pragma in hand to confirm whether the
+wave64 flavour mirrors the asymmetric semantic or is genuinely
+symmetric per 32-lane half.  The fix therefore gates the new
+per-lane select shape behind `ctx.isa.isWave32()`: gfx1250
+sources take the asymmetric path, gfx950 sources keep the
+pre-Session-8 symmetric bpermute cross-wire.  The existing
+`v_permlane32_swap_b32` and `c2_permlane_swap` lit fixtures
+(the latter tightened in this commit to pin the asymmetric
+shape on gfx1250 source) cover the two arms.  If a future
+gfx950→gfx942 regression surfaces that points at the symmetric
+arm, confirm the gfx950 pragma via `docs/manuals/` and
+either (a) extend the gate to the wave64 arm or (b) leave the
+symmetric shape in place, depending on the pragma text.
+
+**Transitional rewrite passes.** Two transitional rewrites
+(`rewrite_permlane16_xor3_partner`,
+`rewrite_permlane16_swap_selfpreserve`) were introduced on
+earlier commits to paper over the symmetric emulation for the
+Triton `tl.sort` / `tl.topk` cross-16 bitonic-merge idiom.
+Under the correct asymmetric semantic the downstream xor3
+composition already produces `partner_seed` through standard
+arithmetic (Triton's idiom was designed for the asymmetric
+semantic in the first place), so both passes are now obsolete:
+the xor3-partner pass's IR fingerprint (direct `xor(bpermute,
+bpermute)`) no longer matches because the bpermutes feed
+`select`s, and the selfpreserve pass's blanket `RAUW →
+seedRoot` actively corrupts the asymmetric select's partner-
+half output.  Defaults have been flipped to **off** for both;
+the raise_cli opt-in flags (`--enable-permlane16-xor3-partner`
+and `--enable-permlane16-swap-selfpreserve`) are retained for
+audit / bisection only.
+
+**Empirical verification** (post-fix):
+
+| Recipe                                     | Pre-fix        | Post-fix |
+| ------------------------------------------ | -------------- | -------- |
+| `matmul_fp16`                              | 5/5 WRONG      | 5/5 match |
+| `matmul_fp16_16x16`                        | 5/5 match (gated) | 5/5 match |
+| `canary_tl_sort_fp32`                      | 1/1 match (via rewrite) | 1/1 match (no rewrite needed) |
+| `canary_tl_sort_fp32_deterministic`        | 1/1 match (via rewrite) | 1/1 match |
+| `canary_tl_sort_fp32_n16*` (7 variants)    | 7/7 match      | 7/7 match |
+| `canary_tl_topk_{bf16,fp32}`               | 2/2 match      | 2/2 match |
+| `canary_pairsort1_fp32_n16_nw2_r32`        | 1/1 match      | 1/1 match |
+
+The WMMA refusal gates in `handle_valu_vop3p.cpp` (Sessions 5/6
+K=4, K=32/K=64 MODREP with `kernelHasPermlane16Swap`) are
+**dropped** — the MODREP MFMA redistribution is now correct for
+both single-WMMA (`matmul_fp16_16x16`) and multi-WMMA
+(`matmul_fp16`) regimes.  The `kernelHasPermlane16Swap` pre-scan
+infrastructure (`raise_context.hpp`, `raiser.cpp`) is retained as
+it's unscoped to this fix — any future cross-WMMA diagnostic
+that wants to detect the multi-WMMA pattern can reuse it.
+
+Regression guards landed with the fix:
+
+* `lit_tests/c2_permlane_swap/` — tightened to pin the ASYMMETRIC
+  shape on gfx1250 source (half-bit AND + icmp + two per-lane
+  selects feeding the final `new_vdst` / `new_src0_out` VGPRs).
+* `lit_tests/v_permlane32_swap_b32/` — left pinned to the
+  SYMMETRIC shape since the gate keeps gfx950 source on the
+  pre-Session-8 arm.
+* `lit_tests/wmma_f32_16x16x4_f32/wmma_f32_16x16x4_f32_modrep.ll`
+  — closes the coverage gap on the K=4 WMMA MODREP path (the
+  old refusal gate that was dropped for this commit had no
+  corpus-level test keeping it honest).
+* `tests/gfx1250_gpu_test.cpp` — `Permlane16Swap`,
+  `Permlane16SwapWave32`, `Permlane16SwapWave32WaveNative`
+  updated to the asymmetric expectations (they were WRONG under
+  the pre-fix symmetric emulation; the tests' block comments
+  literally predicted their current-form failure would root-
+  cause the `tl.sort` cross-16 merge bug).
+* `tests/gfx1250_gpu_test.cpp::Permlane16SwapDivergentExec` —
+  new test pinning the per-destination-lane EXEC gate (odd
+  lanes inactive at the swap site; inactive lanes must retain
+  their initial VGPR values while active lanes see the
+  asymmetric swap).
+
 ## 13. Relationship to other axes
 
 - **SPE / wave-size** (`wave-size-translation.md`): WMMA sites require uniform

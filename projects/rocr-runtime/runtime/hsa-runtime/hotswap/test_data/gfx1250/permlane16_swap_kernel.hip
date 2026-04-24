@@ -28,15 +28,28 @@
 //   vdst_in[L]  = L
 //   src0_in[L]  = 1000 + L
 //
-// Expected after the swap (per the VOP_PERMLANE_SWAP profile):
-//   new_vdst[L]      = src0_in[L XOR 16] = 1000 + (L XOR 16)
-//   new_src0_out[L]  = vdst_in[L XOR 16] = (L XOR 16)
+// Expected after the swap — ASYMMETRIC per-destination-lane
+// semantic from the MI400 Shader Programming Guide pragma §
+// V_PERMLANE16_SWAP_B32 (only two of the four 16-lane rows
+// move; the other two retain their initial values, see
+// hotswap/docs/matrix-translation.md §12.4.7):
 //
-// On the lifted gfx942 wave64 kernel, modulo-replication runs each
-// 32-lane half independently, so the lower (lanes 0..31) and upper
-// (lanes 32..63) halves each perform the swap in isolation. The
-// expected output is identical for all 64 lanes (using the per-half
-// XOR-16 partner), and the test verifies all 64 entries.
+//   isLow[L]         = (L & 16) == 0
+//   new_vdst[L]      = isLow ? vdst_in[L]       : src0_in[L XOR 16]
+//                    = isLow ? L                : 1000 + (L XOR 16)
+//   new_src0_out[L]  = isLow ? vdst_in[L XOR 16]: src0_in[L]
+//                    = isLow ? (L XOR 16)       : 1000 + L
+//
+// On the lifted gfx942 wave64 kernel each 32-lane half performs
+// this swap in isolation (bit 5 of the lane id is preserved by
+// `L XOR 16`), so the per-lane formulae above apply to L in
+// [0, 15], [16, 31], [32, 47], [48, 63] identically — the test
+// verifies all 64 entries.  Pre-Session-8 (2026-04-23) the
+// emulation was symmetric, swapping ALL four rows, and this
+// test's expectations were `new_vdst[L] = 1000 + (L XOR 16)` /
+// `new_src0_out[L] = (L XOR 16)` across all lanes; that
+// symmetric over-swap was the root cause of the matmul_fp16
+// divergence.
 
 #include <hip/hip_runtime.h>
 

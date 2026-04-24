@@ -50,13 +50,17 @@
 //
 // The `v_permlane16_swap_b32` swaps WITHIN each source wave32's
 // 32 lanes.  The "L XOR 16" partner stays within the same source
-// wave.  Expected per-lane output on the lifted wave64 kernel:
+// wave.  Expected per-lane output under the ASYMMETRIC
+// per-destination-lane semantic (MI400 Shader Programming Guide
+// § V_PERMLANE16_SWAP_B32 pragma; see hotswap/docs/matrix-
+// translation.md §12.4.7):
 //
 //   wave-local partner = (L % 32) XOR 16         // 0..31 within wave
 //   wave-base = L - (L % 32)                     // 0, 32, 64, 96
 //   partner   = wave-base + wave_local_partner
-//   new_vdst[L]      = 1000 + partner
-//   new_src0_out[L]  = partner
+//   isLow[L]  = (L & 16) == 0                    // low row of each wave32
+//   new_vdst[L]      = isLow ? L         : 1000 + partner
+//   new_src0_out[L]  = isLow ? partner   : 1000 + L
 //
 // The test reads back all 128 lanes and validates this pattern.
 // Under the hypothesis that the Triton `tl.sort` cross-16 merge

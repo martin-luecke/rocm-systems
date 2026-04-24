@@ -45,9 +45,13 @@
 //   vdst_in[L]  = L                       (for L in [0, 32))
 //   src0_in[L]  = 1000 + L
 //
-// Expected after the swap:
-//   new_vdst[L]      = src0_in[L XOR 16] = 1000 + (L XOR 16)
-//   new_src0_out[L]  = vdst_in[L XOR 16] = (L XOR 16)
+// Expected after the swap — ASYMMETRIC per-destination-lane
+// semantic (MI400 Shader Programming Guide § V_PERMLANE16_SWAP_B32
+// pragma; see hotswap/docs/matrix-translation.md §12.4.7):
+//
+//   isLow[L]         = (L & 16) == 0
+//   new_vdst[L]      = isLow ? L                : 1000 + (L XOR 16)
+//   new_src0_out[L]  = isLow ? (L XOR 16)       : 1000 + L
 //
 // Under wave32 → wave64 cross-widening (salmon target gfx942):
 // the source wave32 has a single pair of 16-lane halves (lanes
