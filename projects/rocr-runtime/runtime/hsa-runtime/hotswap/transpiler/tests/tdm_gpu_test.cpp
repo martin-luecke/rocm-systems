@@ -30,6 +30,25 @@
 //      branches of `handleVIMAGE`'s load/store switch and every level
 //      of `walk()`'s nested b/a/z/yy outer loops.
 //
+//   4. `TdmGpu.LoadStoreRoundtrip5D` — end-to-end dispatch test that
+//      exercises both TDM directions back-to-back in a single kernel.
+//      A 5D tensor is read `global -> LDS` via
+//      `tensor_load_to_lds_d4`, then written `LDS -> global` via
+//      `tensor_store_from_lds_d4` into a separate output buffer.
+//      Every tile element round-trips through LDS, so any drift
+//      between the load and store walkers (stride math, OOB gating,
+//      per-row LDS advance, dim-normalisation) surfaces as a
+//      mismatch in `out` vs the known input pattern. The load-only
+//      / store-only cases in `TdmDescriptorCoverage` isolate each
+//      direction; this test pins that they compose correctly when a
+//      shared LDS staging buffer is observed across multiple
+//      wavefronts — the dispatch launches 128 threads (2 waves on
+//      gfx942 wave64), so the LDS writes from one wave's load must
+//      be visible to the other wave's store, forcing the kernel to
+//      emit a workgroup-scope LDS sync between the two tensor ops.
+//      A single-wave dispatch would hide a bug where the kernel
+//      elides that barrier.
+//
 // All tests `GTEST_SKIP` cleanly when their preconditions are missing —
 // no test data, no hipcc at build time, no GPU — so a developer running
 // the suite without all the pieces in place gets clear feedback without
@@ -514,4 +533,203 @@ INSTANTIATE_TEST_SUITE_P(
     [](const ::testing::TestParamInfo<TdmCase> &info) {
       return info.param.name;
     });
+
+// ============================================================================
+// Load-then-store roundtrip.
+//
+// Same pipeline as `TdmDescriptorCoverage` (lift gfx1250 -> gfx942,
+// dispatch on gfx942 HW, byte-compare), but the kernel under test
+// issues BOTH a `tensor_load_to_lds_d4` and a
+// `tensor_store_from_lds_d4` in sequence against two separate
+// buffers, sharing the same LDS staging region. A mismatch here
+// isolates a composition bug — e.g. the load walker writes a
+// pattern into LDS that the store walker cannot reconstruct — that
+// the direction-isolated coverage test cannot see.
+// ============================================================================
+namespace {
+
+// Run one 5D load+store roundtrip through the full raise -> dispatch
+// -> compare cycle. Returns the number of mismatches (0 == pass),
+// or -1 if any prerequisite step failed before the compare could
+// run.
+int runRoundtripCase(int rank, const uint32_t tile[5],
+                     const char *hsaco_path) {
+  auto bytes = transpiler::readFile(hsaco_path);
+  if (bytes.empty()) {
+    ADD_FAILURE() << "cannot read " << hsaco_path;
+    return -1;
+  }
+
+  constexpr const char *kernel_name = "tdm_load_store_kernel";
+  auto r = transpiler::runPipeline(bytes, "gfx1250", "gfx942", kernel_name);
+  if (!r.success) {
+    ADD_FAILURE() << "raise failed for " << kernel_name
+                  << " (mnemonic=" << r.failMnemonic << ")";
+    return -1;
+  }
+  // Both helpers must appear — the kernel issues each direction
+  // once, so a missing symbol means the handler dropped one on the
+  // floor.
+  EXPECT_NE(r.irText.find("salmon_tdm_load_to_lds"), std::string::npos)
+      << "raised IR does not call salmon_tdm_load_to_lds";
+  EXPECT_NE(r.irText.find("salmon_tdm_store_from_lds"), std::string::npos)
+      << "raised IR does not call salmon_tdm_store_from_lds";
+
+  uint32_t total = 1;
+  for (int i = 0; i < rank; ++i) total *= tile[i];
+
+  uint32_t *d_in = nullptr;
+  uint32_t *d_out = nullptr;
+  TDMDescriptor *d_in_desc = nullptr;
+  TDMDescriptor *d_out_desc = nullptr;
+  TDM_CHECK_HIP(hipMalloc(&d_in,       256 * sizeof(uint32_t)));
+  TDM_CHECK_HIP(hipMalloc(&d_out,      256 * sizeof(uint32_t)));
+  TDM_CHECK_HIP(hipMalloc(&d_in_desc,  sizeof(TDMDescriptor)));
+  TDM_CHECK_HIP(hipMalloc(&d_out_desc, sizeof(TDMDescriptor)));
+
+  std::vector<uint32_t> host_in(256, 0xdeadbeefu);
+  for (uint32_t i = 0; i < total; ++i) host_in[i] = patternValue(i);
+  TDM_CHECK_HIP(hipMemcpy(d_in, host_in.data(), 256 * sizeof(uint32_t),
+                          hipMemcpyHostToDevice));
+  // Sentinel byte is deliberately != patternValue so a kernel that
+  // skips the store leaves a visible 0xcdcdcdcd signature in `out`.
+  TDM_CHECK_HIP(hipMemset(d_out, 0xcd, 256 * sizeof(uint32_t)));
+
+  // Two descriptors that share the tile / rank but point at
+  // different global buffers. `lds_byte_addr` is zero in both, so
+  // the store reads from the same LDS offset the load wrote to.
+  TDMDescriptor in_desc  = buildDescriptor((uint64_t)(uintptr_t)d_in,
+                                           rank, tile);
+  TDMDescriptor out_desc = buildDescriptor((uint64_t)(uintptr_t)d_out,
+                                           rank, tile);
+  TDM_CHECK_HIP(hipMemcpy(d_in_desc,  &in_desc,  sizeof(in_desc),
+                          hipMemcpyHostToDevice));
+  TDM_CHECK_HIP(hipMemcpy(d_out_desc, &out_desc, sizeof(out_desc),
+                          hipMemcpyHostToDevice));
+
+  hipModule_t mod;
+  TDM_CHECK_HIP(hipModuleLoadData(&mod, r.hsaco.data()));
+  hipFunction_t fn;
+  TDM_CHECK_HIP(hipModuleGetFunction(&fn, mod, kernel_name));
+
+  // Kernel ABI: eight group-pointers, input descriptor first,
+  // output descriptor second. The kernel marshals each group into
+  // the gfx1250 TENSOR SGPR operand bank, issues the load, waits
+  // for the tensor unit + LDS visibility with a workgroup-scope
+  // barrier (every wavefront's load must publish to LDS before any
+  // wavefront's store reads it), then issues the store.
+  struct Args {
+    void *in_g0;
+    void *in_g1;
+    void *in_g2;
+    void *in_g3;
+    void *out_g0;
+    void *out_g1;
+    void *out_g2;
+    void *out_g3;
+  } args{
+      (void *)&d_in_desc->g0,  (void *)&d_in_desc->g1,
+      (void *)&d_in_desc->g2,  (void *)&d_in_desc->g3,
+      (void *)&d_out_desc->g0, (void *)&d_out_desc->g1,
+      (void *)&d_out_desc->g2, (void *)&d_out_desc->g3,
+  };
+  size_t argSize = sizeof(args);
+  void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
+                    HIP_LAUNCH_PARAM_BUFFER_SIZE,    &argSize,
+                    HIP_LAUNCH_PARAM_END};
+  // 128 threads = 2 wavefronts on gfx942 (wave64). Multi-wave
+  // dispatch is the whole point of this case (see bullet 4 in the
+  // file-level comment); the direction-isolated cases in
+  // `TdmDescriptorCoverage` already cover single-wave behaviour.
+  // Each wave independently walks the SAME descriptor — the
+  // redundant LDS writes are idempotent (same data, same offsets),
+  // and the cross-wave LDS visibility constraint is enforced by the
+  // kernel's own barrier.
+  TDM_CHECK_HIP(hipModuleLaunchKernel(fn, 1, 1, 1, 128, 1, 1, 0, nullptr,
+                                      nullptr, config));
+  TDM_CHECK_HIP(hipDeviceSynchronize());
+
+  std::vector<uint32_t> host_out(256);
+  TDM_CHECK_HIP(hipMemcpy(host_out.data(), d_out, 256 * sizeof(uint32_t),
+                          hipMemcpyDeviceToHost));
+
+  // CPU-side verification of the round-tripped pattern. Two bands:
+  //
+  //   * i <  total : every element must match the host-side
+  //                  pattern. The read path (global -> LDS) and the
+  //                  write path (LDS -> global) have to agree on
+  //                  element order and strides for this to hold.
+  //   * i >= total : the kernel never dispatched a store past the
+  //                  tile end, so the bytes must still carry the
+  //                  pre-launch `0xcdcdcdcd` sentinel. A failure
+  //                  here is a stride-overrun bug — the store
+  //                  walker wrote past where the load walker read
+  //                  from, so the comparison inside the tile could
+  //                  still pass by coincidence.
+  int mism = 0;
+  for (uint32_t i = 0; i < total; ++i) {
+    if (host_out[i] != patternValue(i)) {
+      if (mism < 4)
+        fprintf(stderr,
+                "  [roundtrip rank=%d] in-tile mismatch at %u: "
+                "got 0x%08x expected 0x%08x\n",
+                rank, i, host_out[i], patternValue(i));
+      ++mism;
+    }
+  }
+  constexpr uint32_t kSentinel = 0xcdcdcdcdu;
+  int overruns = 0;
+  for (uint32_t i = total; i < 256; ++i) {
+    if (host_out[i] != kSentinel) {
+      if (overruns < 4)
+        fprintf(stderr,
+                "  [roundtrip rank=%d] out-of-tile overrun at %u: "
+                "got 0x%08x expected 0x%08x (sentinel)\n",
+                rank, i, host_out[i], kSentinel);
+      ++overruns;
+    }
+  }
+  // Fold overruns into the mismatch count so the top-level
+  // EXPECT_EQ surfaces both classes of failure with one knob.
+  mism += overruns;
+
+  (void)hipModuleUnload(mod);
+  TDM_CHECK_HIP(hipFree(d_in));
+  TDM_CHECK_HIP(hipFree(d_out));
+  TDM_CHECK_HIP(hipFree(d_in_desc));
+  TDM_CHECK_HIP(hipFree(d_out_desc));
+  return mism;
+}
+
+} // namespace
+
+TEST_F(TdmGpu, LoadStoreRoundtrip5D) {
+  if (!transpiler::tdmRuntimeAvailable())
+    GTEST_SKIP() << "TDM runtime bitcode not embedded "
+                    "(transpiler built without hipcc).";
+  if (!kGfx1250DataDir)
+    GTEST_SKIP() << "No GFX1250_TEST_DATA_DIR configured.";
+
+  std::string path = std::string(kGfx1250DataDir) +
+                     "/tdm_load_store_gfx1250.hsaco";
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0)
+    GTEST_SKIP() << "missing fixture: " << path
+                 << " (regenerate via the recipe in "
+                    "test_data/gfx1250/tdm_load_store_kernel.hip)";
+
+  // 5D tile: 4 * 2 * 2 * 2 * 2 = 64 elements. The kernel dispatches
+  // 128 threads (2 waves on gfx942 wave64); each wave independently
+  // walks this descriptor, so both waves redundantly copy the same
+  // 64 elements through LDS. Tile size is decoupled from workgroup
+  // size at the TDM layer — `walk()` stripes X across lanes of a
+  // single wave, so multi-wave dispatch is a LDS-sync / composition
+  // test rather than a parallelism test.
+  const uint32_t tile[5] = {4, 2, 2, 2, 2};
+  int mism = runRoundtripCase(5, tile, path.c_str());
+  uint32_t total = 1;
+  for (int i = 0; i < 5; ++i) total *= tile[i];
+  EXPECT_EQ(mism, 0) << "LoadStoreRoundtrip5D: " << mism << " / " << total
+                     << " mismatches";
+}
 #endif // __HIP_PLATFORM_AMD__
