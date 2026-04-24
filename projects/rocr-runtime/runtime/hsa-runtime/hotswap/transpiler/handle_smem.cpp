@@ -1,13 +1,8 @@
 #include "handlers.hpp"
-#include "pipeline.hpp" // isStrictMode()
 
-#include "llvm/IR/IntrinsicsAMDGPU.h"
-#include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <cassert>
-#include <utility>
-#include <vector>
 
 #define DEBUG_TYPE "transpiler"
 
@@ -22,16 +17,16 @@ namespace {
 //
 // Why this exists: both the dword-granular S_LOAD_B* block and the
 // narrow-SMEM (S_LOAD_U8/I8/U16/I16) block need to answer the same
-// question — "is this load's sbase the kernarg pointer?" — in order
-// to route through `extractKernargDword` (dword path) or to refuse
-// (narrow path). The previous implementation hardcoded `baseIdx == 0`,
-// which is only correct when KernargSegmentPtr is the first enabled
-// user-SGPR source. That held for Triton kernels (where it is the
-// only enabled source) but silently broke as soon as a kernel also
-// enabled PrivateSegmentBuffer (4 dwords), DispatchPtr (2 dwords),
-// or QueuePtr (2 dwords) ahead of it in the canonical
-// enable_sgpr_* order — the kernarg pointer then slides up to
-// s[2:3], s[6:7], s[8:9], etc., and every `baseIdx == 0` check
+// question — "is this load's sbase the kernarg pointer?" — to decide
+// between the addrspace(4) (kernarg) cast and the addrspace(1)
+// (global) cast. The previous implementation hardcoded
+// `baseIdx == 0`, which is only correct when KernargSegmentPtr is
+// the first enabled user-SGPR source. That held for Triton kernels
+// (where it is the only enabled source) but silently broke as soon
+// as a kernel also enabled PrivateSegmentBuffer (4 dwords),
+// DispatchPtr (2 dwords), or QueuePtr (2 dwords) ahead of it in the
+// canonical enable_sgpr_* order — the kernarg pointer then slides up
+// to s[2:3], s[6:7], s[8:9], etc., and every `baseIdx == 0` check
 // incorrectly rejects it.
 //
 // The layout object is the single source of truth for the source
@@ -54,6 +49,18 @@ int getKernargPtrSgpr(RaiseContext &ctx) {
         "The raiser must populate this before dispatching to handlers; "
         "missing wiring is a bug.");
   return ctx.userSgprLayout->kernargSegmentPtrSgpr;
+}
+
+// Per-dword provenance lookup for the source-ABI kernarg-pair low SGPR.
+// Returns the default `Unknown` slot when no kernarg pointer is enabled
+// or the index falls outside the tracked range, so the callers can
+// uniformly compare `kind` without a separate range guard.
+RaiseContext::SgprKernargProvenance
+kernargPairProvenance(RaiseContext &ctx, int kernargPtrSgpr) {
+  if (kernargPtrSgpr < 0 ||
+      static_cast<size_t>(kernargPtrSgpr) >= ctx.sgprKernargProvenance.size())
+    return {};
+  return ctx.sgprKernargProvenance[kernargPtrSgpr];
 }
 
 } // namespace
@@ -103,208 +110,30 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
          base.baseIdx == kernargPtrSgpr);
     bool isKernarg =
         baseIsKernargPair &&
-        ctx.kernargPtrDelta.baseKind ==
-            RaiseContext::KernargPtrDelta::BaseKind::Kernarg;
+        kernargPairProvenance(ctx, kernargPtrSgpr).kind ==
+            RaiseContext::SgprKernargProvenance::Kind::Kernarg;
 
-    // The kernarg-slot fast path routes `isKernarg && immOffset` loads
-    // through `extractKernargDword` — reading the IR-level kernel
-    // argument directly rather than dereferencing the SGPR pair. That
-    // pair's alloca was seeded with a null sentinel at kernel entry
-    // (raiser.cpp Phase 4), so the dynamic path through the SGPR value
-    // is not a valid pointer while the pair still denotes the kernarg
-    // segment. The fast path is therefore the *only* correct lowering
-    // when the pair's sbase is the entry kernarg pointer (possibly plus
-    // a tracked constant delta).
+    // The kernarg SGPR pair is seeded with `ptrtoint(amdgcn_kernarg_segment_ptr)`
+    // in `raiser.cpp` Phase 4, so the generic GEP+load path serves every
+    // kernarg-derived SMEM load uniformly: immediate offsets, SGPR offsets,
+    // tracked const deltas (`s_add_u32`/`s_addc_u32`), runtime arithmetic
+    // (`s_lshl2_add_u32`, `s_add_co_u32 sN, sN, sM`), and full pair
+    // overwrites (Triton/SGLang `s[0:1] = preloaded_ptr + wg_offset`,
+    // Tensile HBMArgs `s_load_b64 s[0:1], s[0:1], 0x10`) all flow through
+    // `loadSGPR64` correctly.
     //
-    // Once the pair has been fully overwritten with a non-kernarg value
-    // (for example SGLang/Triton computes `s[0:1] = preloaded_ptr +
-    // wg_offset` before issuing `s_load_b32 sN, s[0:1], 0`), it is no
-    // longer a kernarg-segment pointer despite occupying the same
-    // physical SGPRs. `raiser.cpp` marks that provenance as NonKernarg,
-    // and this handler deliberately falls through to the normal SGPR
-    // address path. Unknown provenance still refuses loudly below.
-    //
-    // When the kernel has shifted the pair by a const delta before the
-    // load (Tensile UniversalArgs: `s_add_u32 ka, ka, 0x10 ; s_addc_u32
-    // ka+1, ka+1, 0` ahead of the downstream kernarg fetches), the
-    // raiser's post-handler tracker (RaiseContext::KernargPtrDelta)
-    // records that delta so we can thread it through the fast path
-    // here. Issue #21 is the miscompile this plumbing closes: without
-    // the delta, the shifted load was extracting from the entry-time
-    // offsets, silently pulling the wrong kernarg bytes into the
-    // destination SGPRs.
-    //
-    // Refusal invariants (all loud via RaiseFailure::smemKernargMiss):
-    //
-    //  (a) `isKernarg && !delta.valid` — the pair has been clobbered in
-    //      a way the tracker cannot describe as a single 64-bit const
-    //      delta (non-canonical-shape write, overlapping write,
-    //      cross-BB merge with divergent predecessors). The sentinel-
-    //      null IR pointer cannot rescue the load, and inventing a
-    //      "best guess" offset would silently miscompile. Refuse and
-    //      require the pipeline to confront the mutation explicitly.
-    //
-    //  (b) `isKernarg && delta.pendingLow` — half-committed 64-bit
-    //      add (low dword has been advanced but the complementary
-    //      S_ADDC_U32 has not fired yet). Refusing here is how the
-    //      handler signals that the carry plumbing is mid-torn; the
-    //      post-handler hook will either commit or invalidate on the
-    //      NEXT instruction, but THIS instruction (the SMEM load in
-    //      between) cannot be served correctly either way. In
-    //      practice the Tensile preamble shape never inserts an SMEM
-    //      load between the `s_add_u32 lo` and the
-    //      `s_addc_u32 hi, hi, 0`, so this branch is defensive.
-    //
-    //  (c) `isKernarg && !immOffset` — dynamic (SGPR-valued) SMEM
-    //      offset through the kernarg pointer. `extractKernargDword`
-    //      requires a compile-time offset to pick the matching IR
-    //      argument. No kernel in the kerneldex corpus exercises this
-    //      shape; refuse rather than silently substitute zero.
-    int64_t effectiveByteOffset = byteOffset;
-    if (baseIsKernargPair &&
-        ctx.kernargPtrDelta.baseKind ==
-            RaiseContext::KernargPtrDelta::BaseKind::Unknown) {
-      llvm::errs()
-          << "transpiler: " << di.mnemonic << ": kernarg-pair SGPR (s["
-          << kernargPtrSgpr << ":" << (kernargPtrSgpr + 1)
-          << "]) has unknown provenance at this load site. It may still be "
-             "derived from the entry kernarg pointer by a non-foldable "
-             "mutation or by a CFG merge with divergent incoming values; "
-             "falling through to the normal SGPR-address path would "
-             "dereference the sentinel-seeded entry value and can silently "
-             "miscompile. Refuse instead.\n";
-      hr.failure = RaiseFailure::smemKernargMiss(di);
-      return hr;
-    }
-
-    if (isKernarg) {
-      if (ctx.kernargPtrDelta.pendingLow) {
-        llvm::errs()
-            << "transpiler: " << di.mnemonic
-            << ": kernarg-pair SGPR is mid-64-bit-add (S_ADD_U32 on low "
-               "staged, S_ADDC_U32 on high not yet committed); the SMEM "
-               "load sees a torn pointer value — refuse loudly rather "
-               "than extract from a half-updated 64-bit address\n";
-        hr.failure = RaiseFailure::smemKernargMiss(di);
-        return hr;
-      }
-      if (!ctx.kernargPtrDelta.valid) {
-        llvm::errs()
-            << "transpiler: " << di.mnemonic
-            << ": kernarg-pair SGPR (s[" << kernargPtrSgpr << ":"
-            << (kernargPtrSgpr + 1)
-            << "]) has been modified in a way the raiser cannot fold to a "
-               "64-bit constant delta from entry (e.g. non-canonical "
-               "s_add/s_addc pairing, cross-BB merge with divergent "
-               "predecessors, overwrite via s_mov_b32 or s_load_b64 "
-               "through a different base). Extracting from the kernarg "
-               "slot table using the load's immediate offset alone would "
-               "silently miscompile (this is issue #21). The sentinel-null "
-               "IR value in the SGPR alloca cannot rescue the dynamic "
-               "path either — refuse instead of falling through\n";
-        hr.failure = RaiseFailure::smemKernargMiss(di);
-        return hr;
-      }
-      if (!immOffset) {
-        llvm::errs()
-            << "transpiler: " << di.mnemonic
-            << ": dynamic (SGPR) SMEM offset against the kernarg pointer "
-               "cannot be resolved to a static kernarg slot; the "
-               "extractKernargDword interface requires a compile-time "
-               "byte offset\n";
-        hr.failure = RaiseFailure::smemKernargMiss(di);
-        return hr;
-      }
-      effectiveByteOffset = ctx.kernargPtrDelta.delta + byteOffset;
-    }
-
-    LLVM_DEBUG(if (isKernarg && immOffset) {
-      llvm::dbgs() << "transpiler: SMEM: mn=" << di.mnemonic
-                   << " raw=" << di.rawMnemonic << " full=\"" << di.fullText
-                   << "\" off=" << byteOffset
-                   << " delta=" << ctx.kernargPtrDelta.delta
-                   << " effective=" << effectiveByteOffset << "\n";
-    });
-
-    if (isKernarg && immOffset &&
-        effectiveByteOffset < ctx.kernargs.implicitArgsBase) {
-      // Materialise the load one dword at a time. Per-dword extraction
-      // is the only shape that handles every kernarg layout we see in
-      // the corpus uniformly:
-      //   * scalar args (i32, i64, ptr) — the helper splits 64-bit args
-      //     into low/high dwords as needed (B96 over a (ptr, i32)
-      //     pair, etc.);
-      //   * `by_value` aggregates with size > 8 (Triton tensor-
-      //     descriptor structs, tensilelite kernarg blobs) — the
-      //     raiser's per-dword decomposition (raiser.cpp) makes every
-      //     interior dword addressable as a standalone i32 slot, so a
-      //     B96 load that lands inside such a struct (e.g. offset 8
-      //     inside an 80-byte arg) materialises correctly without any
-      //     aggregate-aware extract logic in this handler.
-      // If any dword in the load can't be served (out-of-range offset,
-      // partial-overlap with an unsupported slot type, etc.) we refuse
-      // loudly with the helper's diagnostic. The no-fallback rule
-      // forbids reading uninitialised SGPRs or substituting zero for
-      // a missing dword — a kernel that gets a wrong kernarg byte will
-      // compute out-of-bounds GPU addresses, and that is the failure
-      // mode this refusal exists to surface.
-      //
-      // Test back-reference: lit_tests/s_load_b96_kernarg/ exercises
-      // the by_value-aggregate path end-to-end with an explicit
-      // `s_load_b96 s[0:2], s[0:1], 0x4` over a 16-byte by_value;
-      // any change to this loop or to `extractKernargDword` in
-      // kernarg_layout.cpp must keep that fixture's IR signature
-      // and `phi i32 [ %arg{1,2}, ... ]` data-flow pins green.
-      //
-      // Delta-aware kernarg offset. `effectiveByteOffset` folds in the
-      // const-delta accumulated by the post-handler tracker (see
-      // `RaiseContext::KernargPtrDelta`); when the kernel never mutated
-      // the kernarg pair, `delta == 0` and the fast path behaves
-      // identically to pre-fix. The Tensile UniversalArgs case (delta
-      // != 0) now correctly extracts from `delta + imm` instead of
-      // from `imm` alone.
-      for (int d = 0; d < loadDwords; ++d) {
-        int dwordOffset = (int)effectiveByteOffset + d * 4;
-        std::string why;
-        Value *v = extractKernargDword(ctx.kernargs, ctx.B, ctx.kernel,
-                                       dwordOffset, &why);
-        if (!v) {
-          llvm::errs() << "transpiler: " << di.mnemonic
-                       << " kernarg load loadBytes=" << loadBytes
-                       << " byteOffset=" << byteOffset
-                       << " delta=" << ctx.kernargPtrDelta.delta
-                       << " effectiveByteOffset=" << effectiveByteOffset
-                       << " dword=" << d
-                       << " (offset=" << dwordOffset << "): " << why << "\n";
-          hr.failure = RaiseFailure::smemKernargMiss(di);
-          return hr;
-        }
-        ctx.regs.storeSGPR32(ctx.B, dest.baseIdx + d, v);
-      }
-    } else if (isKernarg && immOffset) {
-      if (isStrictMode()) {
-        hr.failure = RaiseFailure::strictUnsafeLowering(
-            di, "implicitarg.ptr",
-            "cross-arch implicitarg.ptr lowering is unresolved: source implicit-arg "
-            "offsets are being applied to the target runtime hidden-arg block");
-        return hr;
-      }
-      int implOffset = effectiveByteOffset - ctx.kernargs.implicitArgsBase;
-      LLVM_DEBUG(llvm::dbgs() << "transpiler: implicit kernarg load: byteOffset="
-                              << byteOffset
-                              << " implicitArgsBase=" << ctx.kernargs.implicitArgsBase
-                              << " implOffset=" << implOffset << "\n");
-      Function *fnImplicitArgPtr = Intrinsic::getOrInsertDeclaration(
-          &ctx.M, Intrinsic::amdgcn_implicitarg_ptr);
-      Value *implPtr =
-          ctx.B.CreateCall(fnImplicitArgPtr, {}, "implicitarg_ptr");
-      Value *gep = ctx.B.CreateInBoundsGEP(ctx.i8Ty, implPtr,
-                                           ctx.B.getInt64(implOffset), "impl_gep");
-      ctx.regs.storeSGPR32(ctx.B, dest.baseIdx,
-                           ctx.B.CreateLoad(ctx.i32Ty, gep, "impl_load"));
-    } else {
+    // The per-dword `RaiseContext::sgprKernargProvenance` map is read
+    // here purely as an addrspace hint: when the pair is still derived
+    // from the entry kernarg pointer (unmodified or shifted by a
+    // tracked constant delta), pick `addrspace(4)` so the backend
+    // selects SMEM (`s_load_*`); otherwise fall through to
+    // `addrspace(1)` (global) so the backend can lower to VMEM or, for
+    // uniform bases, late-promote back to SMEM.
+    {
+      llvm::Type *ptrTy = isKernarg ? llvm::PointerType::get(ctx.C, 4)
+                                    : ctx.ptrGlobalTy;
       Value *baseAddr = ctx.regs.loadSGPR64(ctx.B, base.baseIdx);
-      Value *ptr = ctx.B.CreateIntToPtr(baseAddr, ctx.ptrGlobalTy);
+      Value *ptr = ctx.B.CreateIntToPtr(baseAddr, ptrTy);
       if (immOffset) {
         if (byteOffset != 0)
           ptr = ctx.B.CreateInBoundsGEP(ctx.i8Ty, ptr, ctx.B.getInt64(byteOffset));
@@ -406,13 +235,12 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
     bool baseIsKernargPair =
         (base.kind == ParsedReg::SGPR && kernargPtrSgpr >= 0 &&
          base.baseIdx == kernargPtrSgpr);
+    auto pairKind = kernargPairProvenance(ctx, kernargPtrSgpr).kind;
     bool isKernarg =
         baseIsKernargPair &&
-        ctx.kernargPtrDelta.baseKind ==
-            RaiseContext::KernargPtrDelta::BaseKind::Kernarg;
+        pairKind == RaiseContext::SgprKernargProvenance::Kind::Kernarg;
     if (baseIsKernargPair &&
-        ctx.kernargPtrDelta.baseKind ==
-            RaiseContext::KernargPtrDelta::BaseKind::Unknown) {
+        pairKind == RaiseContext::SgprKernargProvenance::Kind::Unknown) {
       llvm::errs()
           << "transpiler: " << di.mnemonic << ": kernarg-pair SGPR (s["
           << kernargPtrSgpr << ":" << (kernargPtrSgpr + 1)

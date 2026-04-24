@@ -155,12 +155,11 @@ ThreadLoopDecisionResult decideThreadLoopFallback(unsigned sourceWaveSize,
 //    longer denotes the sentinel-modeled entry kernarg pointer?"
 //
 // This is intentionally not a general dataflow engine. It is a local
-// provenance update over the SGPR dword table stored in RaiseContext, paired
-// with the older constant-delta tracker for the original kernarg pair. Unknown
-// provenance remains loud: handle_smem.cpp refuses loads through s[ka:ka+1]
-// unless this updater proves either `Kernarg + const delta` or `NonKernarg`.
+// provenance update over the per-SGPR-dword table stored in RaiseContext.
+// Unknown provenance is the safe default: handle_smem.cpp falls back to the
+// addrspace(1) path on s[ka:ka+1] loads when this updater cannot prove
+// either `Kernarg + const delta` or `NonKernarg`.
 class KernargSgprProvenanceUpdater {
-  using PairKind = RaiseContext::KernargPtrDelta::BaseKind;
   using DwordProv = RaiseContext::SgprKernargProvenance;
   using DwordKind = RaiseContext::SgprKernargProvenance::Kind;
 
@@ -407,30 +406,37 @@ private:
   }
 
   void markKernargUnknown() {
-    Ctx.kernargPtrDelta.baseKind = PairKind::Unknown;
-    Ctx.kernargPtrDelta.delta = 0;
-    Ctx.kernargPtrDelta.valid = false;
-    Ctx.kernargPtrDelta.pendingLow = false;
-    Ctx.kernargPtrDelta.pendingLowDelta = 0;
-    Ctx.setKernargPairProvenance(PairKind::Unknown);
+    Ctx.kernargPairPendingLow = false;
+    Ctx.kernargPairPendingLowDelta = 0;
+    Ctx.setKernargPairProvenance(DwordKind::Unknown);
   }
 
   void markNonKernarg() {
-    Ctx.kernargPtrDelta.baseKind = PairKind::NonKernarg;
-    Ctx.kernargPtrDelta.delta = 0;
-    Ctx.kernargPtrDelta.valid = false;
-    Ctx.kernargPtrDelta.pendingLow = false;
-    Ctx.kernargPtrDelta.pendingLowDelta = 0;
-    Ctx.setKernargPairProvenance(PairKind::NonKernarg);
+    Ctx.kernargPairPendingLow = false;
+    Ctx.kernargPairPendingLowDelta = 0;
+    Ctx.setKernargPairProvenance(DwordKind::NonKernarg);
   }
 
   void markTrackedKernarg(int64_t Delta) {
-    Ctx.kernargPtrDelta.baseKind = PairKind::Kernarg;
-    Ctx.kernargPtrDelta.delta = Delta;
-    Ctx.kernargPtrDelta.valid = true;
-    Ctx.kernargPtrDelta.pendingLow = false;
-    Ctx.kernargPtrDelta.pendingLowDelta = 0;
-    Ctx.setKernargPairProvenance(PairKind::Kernarg, Delta);
+    Ctx.kernargPairPendingLow = false;
+    Ctx.kernargPairPendingLowDelta = 0;
+    Ctx.setKernargPairProvenance(DwordKind::Kernarg, Delta);
+  }
+
+  // True iff the kernarg pair is still proven to be a kernarg-segment
+  // pointer (entry value plus a fully-committed sequence of canonical
+  // 64-bit const-adds). Mid-stage (`kernargPairPendingLow`) reads as
+  // false so the SMEM handler does not consume a torn pointer.
+  bool isPairKernargDerived() const {
+    if (Ctx.kernargPairPendingLow)
+      return false;
+    auto Lo = dwordProvenance(KaLo);
+    auto Hi = dwordProvenance(KaHi);
+    return Lo.kind == DwordKind::Kernarg && Hi.kind == DwordKind::Kernarg;
+  }
+
+  int64_t pairCommittedDelta() const {
+    return dwordProvenance(KaLo).delta;
   }
 
   bool sgprOverlapsKernargPair(ParsedReg PR) const {
@@ -494,11 +500,8 @@ private:
     auto Hi = dwordProvenance(KaHi);
     if (Lo.kind == DwordKind::NonKernarg &&
         Hi.kind == DwordKind::NonKernarg) {
-      Ctx.kernargPtrDelta.baseKind = PairKind::NonKernarg;
-      Ctx.kernargPtrDelta.valid = false;
-      Ctx.kernargPtrDelta.pendingLow = false;
-      Ctx.kernargPtrDelta.pendingLowDelta = 0;
-      Ctx.kernargPtrDelta.delta = 0;
+      Ctx.kernargPairPendingLow = false;
+      Ctx.kernargPairPendingLowDelta = 0;
     }
   }
 
@@ -541,8 +544,9 @@ private:
 
   void updateOriginalKernargPair(bool WritesLo, bool WritesHi) {
     if (!(WritesLo || WritesHi)) {
-      if (Ctx.kernargPtrDelta.valid && Ctx.kernargPtrDelta.pendingLow &&
-          DI.defsSCC)
+      // Anything that writes SCC mid-stage breaks the carry the
+      // imminent S_ADDC_U32 needs. Drop the half-staged add.
+      if (Ctx.kernargPairPendingLow && DI.defsSCC)
         markKernargUnknown();
       return;
     }
@@ -556,11 +560,8 @@ private:
       return;
     }
     if (!WritesFullPair && allSourcesDefinitelyNonKernarg()) {
-      Ctx.kernargPtrDelta.baseKind = PairKind::Unknown;
-      Ctx.kernargPtrDelta.delta = 0;
-      Ctx.kernargPtrDelta.valid = false;
-      Ctx.kernargPtrDelta.pendingLow = false;
-      Ctx.kernargPtrDelta.pendingLowDelta = 0;
+      Ctx.kernargPairPendingLow = false;
+      Ctx.kernargPairPendingLowDelta = 0;
       if (WritesLo)
         setOriginalPairDwordKind(KaLo, DwordKind::NonKernarg);
       if (WritesHi)
@@ -568,12 +569,12 @@ private:
       refreshOriginalPairFromDwords();
       return;
     }
-    if (!Ctx.kernargPtrDelta.valid) {
+    if (!isPairKernargDerived() && !Ctx.kernargPairPendingLow) {
       markKernargUnknown();
       return;
     }
     if (WritesHi && !WritesLo && isKernargHighCanonicalMask() &&
-        !Ctx.kernargPtrDelta.pendingLow)
+        !Ctx.kernargPairPendingLow)
       return;
     if (WritesLo && !WritesHi && DI.semOp == SemOp::S_ADD_U32) {
       auto [Ok, Imm] = classifyConstInPlaceAdd(KaLo);
@@ -581,21 +582,23 @@ private:
         markKernargUnknown();
         return;
       }
-      if (Ctx.kernargPtrDelta.pendingLow) {
+      if (Ctx.kernargPairPendingLow) {
         markKernargUnknown();
         return;
       }
-      Ctx.kernargPtrDelta.pendingLow = true;
-      Ctx.kernargPtrDelta.pendingLowDelta = Imm;
-      Ctx.setKernargPairProvenance(PairKind::Unknown);
+      // Capture the post-commit delta now (before clobbering the
+      // per-dword Kernarg+delta state to Unknown) so the matching
+      // S_ADDC_U32 can restore Kernarg with the right total delta.
+      Ctx.kernargPairPendingLow = true;
+      Ctx.kernargPairPendingLowDelta = pairCommittedDelta() + Imm;
+      Ctx.setKernargPairProvenance(DwordKind::Unknown);
       return;
     }
     if (WritesHi && !WritesLo && DI.semOp == SemOp::S_ADDC_U32 &&
-        Ctx.kernargPtrDelta.pendingLow) {
+        Ctx.kernargPairPendingLow) {
       auto [Ok, Imm] = classifyConstInPlaceAdd(KaHi);
       if (Ok && Imm == 0) {
-        markTrackedKernarg(Ctx.kernargPtrDelta.delta +
-                           Ctx.kernargPtrDelta.pendingLowDelta);
+        markTrackedKernarg(Ctx.kernargPairPendingLowDelta);
       } else {
         markKernargUnknown();
       }
@@ -604,9 +607,9 @@ private:
     markKernargUnknown();
   }
 
-  void setPairFromBaseKind(int Dst, PairKind Kind, int64_t Delta = 0) {
+  void setPairFromDwordKind(int Dst, DwordKind Kind, int64_t Delta = 0) {
     switch (Kind) {
-    case PairKind::Kernarg: {
+    case DwordKind::Kernarg: {
       DwordProv Lo, Hi;
       Lo.kind = DwordKind::Kernarg;
       Lo.delta = Delta;
@@ -618,37 +621,37 @@ private:
       setDwordProv(Dst + 1, Hi);
       break;
     }
-    case PairKind::NonKernarg:
+    case DwordKind::NonKernarg:
       setDwordKind(Dst, DwordKind::NonKernarg);
       setDwordKind(Dst + 1, DwordKind::NonKernarg);
       break;
-    case PairKind::Unknown:
+    case DwordKind::Unknown:
       setDwordKind(Dst, DwordKind::Unknown);
       setDwordKind(Dst + 1, DwordKind::Unknown);
       break;
     }
   }
 
-  std::pair<PairKind, int64_t> pairProvenanceFromReg(ParsedReg PR) const {
+  std::pair<DwordKind, int64_t> pairProvenanceFromReg(ParsedReg PR) const {
     if (PR.kind != ParsedReg::SGPR)
-      return {PairKind::Unknown, 0};
+      return {DwordKind::Unknown, 0};
     auto Lo = dwordProvenance(PR.baseIdx);
     auto Hi = dwordProvenance(PR.baseIdx + 1);
     if (Lo.kind == DwordKind::NonKernarg &&
         Hi.kind == DwordKind::NonKernarg)
-      return {PairKind::NonKernarg, 0};
+      return {DwordKind::NonKernarg, 0};
     if (Lo.kind == DwordKind::Kernarg && Hi.kind == DwordKind::Kernarg &&
         Lo.subDword == 0 && Hi.subDword == 1 && Lo.delta == Hi.delta)
-      return {PairKind::Kernarg, Lo.delta};
-    return {PairKind::Unknown, 0};
+      return {DwordKind::Kernarg, Lo.delta};
+    return {DwordKind::Unknown, 0};
   }
 
-  std::pair<PairKind, int64_t> pairProvenanceFromSrc0() {
+  std::pair<DwordKind, int64_t> pairProvenanceFromSrc0() {
     if (DI.numSrcs < 1)
-      return {PairKind::Unknown, 0};
+      return {DwordKind::Unknown, 0};
     unsigned Idx = DI.srcMap[0];
     if (!DI.isReg(Idx))
-      return {PairKind::NonKernarg, 0};
+      return {DwordKind::NonKernarg, 0};
     return pairProvenanceFromReg(Ctx.parseReg(DI.getReg(Idx), Idx));
   }
 
@@ -681,7 +684,7 @@ private:
     }
     if (DI.semOp == SemOp::S_MOV_B64 && DefDwords >= 2) {
       auto [Kind, Delta] = pairProvenanceFromSrc0();
-      setPairFromBaseKind(Def.baseIdx, Kind, Delta);
+      setPairFromDwordKind(Def.baseIdx, Kind, Delta);
       return;
     }
     if (DI.semOp == SemOp::S_MOV_B32 && DefDwords == 1) {
@@ -1221,6 +1224,8 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
       Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_workgroup_id_x);
   Function *fnWorkgroupIdY =
       Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_workgroup_id_y);
+  Function *fnKargPtr =
+      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_kernarg_segment_ptr);
   // Build the source-ISA user-SGPR ABI from the kernel descriptor.
   // Phase 4 seeding and handler-side ABI-sensitive decoding (e.g.
   // handle_smem's kernarg-pointer detection) both key off this layout.
@@ -1257,10 +1262,16 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
   // enable_sgpr_* toggles legally move the kernarg pointer and workgroup-id
   // SGPRs away from s[0:1]/s2/s3. Hardcoding those indices mis-seeds entry
   // state and turns real source values into undef reads on the JIT path.
+  //
+  // Seed the kernarg pair with ptrtoint(amdgcn_kernarg_segment_ptr) so the
+  // generic GEP+load path in handle_smem.cpp materialises kernarg SMEM
+  // loads as real scalar loads (the backend selects s_load_* off the
+  // addrspace(4) cast). storeSGPR64 ptrtoint-splits the pointer into two
+  // i32 halves; loadSGPR64 reconstructs and the SMEM handler casts back
+  // to ptr addrspace(4).
   if (userSgprLayout.kernargSegmentPtrSgpr >= 0) {
-    regs.storeSGPR64(
-        B, userSgprLayout.kernargSegmentPtrSgpr,
-        Constant::getNullValue(PointerType::get(C, 4)));
+    regs.storeSGPR64(B, userSgprLayout.kernargSegmentPtrSgpr,
+                     B.CreateCall(fnKargPtr, {}, "kernarg_ptr"));
   }
   if (userSgprLayout.workgroupIdXSgpr >= 0) {
     regs.storeSGPR32(B, userSgprLayout.workgroupIdXSgpr,
@@ -1495,18 +1506,20 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
   // Populates `ctx.kernargPristineBBs` with the set of BB-start
   // offsets where the kernarg-pointer SGPR pair is guaranteed to still
   // hold its kernel-entry value along EVERY CFG path that reaches
-  // the BB. `handle_smem.cpp` consults this (via the tracker
-  // `RaiseContext::KernargPtrDelta`) to decide whether to take the
-  // kernarg-slot fast path or refuse loudly.
+  // the BB. `handle_smem.cpp` consults this (via the per-dword
+  // `RaiseContext::sgprKernargProvenance` map seeded at BB entry) to
+  // decide whether the kernarg-pair load uses the addrspace(4)
+  // (kernarg) cast or falls back to the addrspace(1) (global) cast.
   //
   // This closes issue #21's silent miscompile in the Tensile
   // UniversalArgs shape (`s_add_u32 ka, ka, 0x10 ; s_addc_u32 ka+1,
   // ka+1, 0 ; s_load_b* s[sDST:…], s[ka:ka+1], imm`): the NORMAL-path
   // BB that contains the shift still enters pristine (its sole
   // predecessor is the entry BB, which never writes the pair), so
-  // the post-handler hook below can stage the delta and the shifted
-  // downstream loads correctly extract via `extractKernargDword(delta
-  // + imm)` instead of `extractKernargDword(imm)`.
+  // the post-handler hook below correctly tracks the pair as Kernarg
+  // through the s_add/s_addc and the downstream SMEM load lands on
+  // an `addrspace(4)` cast that the backend lowers to `s_load_*`
+  // against the kernarg segment with the right runtime offset.
   //
   // The analysis is a forward dataflow to fixed point:
   //
@@ -1523,9 +1536,10 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
   //
   // Skipped entirely when `kernargSegmentPtrSgpr < 0` (the kernel
   // descriptor disables the kernarg pointer — no pair to track); in
-  // that case every BB is trivially "pristine" because the tracker
-  // never fires in handle_smem.cpp. We still populate the set to
-  // keep the resetKernargPtrDeltaAtBBBoundary code path uniform.
+  // that case every BB is trivially "pristine" because the
+  // provenance check never fires in handle_smem.cpp. We still
+  // populate the set to keep the
+  // `resetSgprKernargProvenanceAtBBBoundary` code path uniform.
   {
     const int kaLo = userSgprLayout.kernargSegmentPtrSgpr;
     const int kaHi = (kaLo >= 0) ? (kaLo + 1) : -1;
@@ -1887,16 +1901,16 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
       // to a proper per-BB merge (see sgpr-wave-mask-translation.md
       // section 7 evolution path).
       ctx.clearSgprWaveMaskShadow();
-      // Reset the kernarg-pair const-delta tracker for the new BB,
-      // consulting the precomputed `kernargPristineBBs` dataflow
+      // Reset the per-SGPR-dword kernarg provenance map for the new
+      // BB, consulting the precomputed `kernargPristineBBs` dataflow
       // result (Phase 4.5 below) to decide whether the pair is
       // guaranteed-pristine on every incoming CFG edge. When it is,
-      // the tracker enters `valid = true, delta = 0`; otherwise
-      // `valid = false` and handle_smem.cpp refuses the kernarg-slot
-      // fast path loudly for any kernarg-pair SMEM load in this BB.
-      // See `RaiseContext::KernargPtrDelta` and
-      // `resetKernargPtrDeltaAtBBBoundary` for the full contract.
-      ctx.resetKernargPtrDeltaAtBBBoundary(di.offset);
+      // the pair re-enters as `Kernarg + delta=0`; otherwise as
+      // `Unknown` and handle_smem.cpp falls back to the addrspace(1)
+      // global path on any kernarg-pair SMEM load in this BB. See
+      // `RaiseContext::SgprKernargProvenance`'s doc block for the
+      // full contract.
+      ctx.resetSgprKernargProvenanceAtBBBoundary(di.offset);
     }
 
     ctx.computeVGPRAdjust(di);
@@ -2036,16 +2050,15 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
         }
       }
 
-      // Kernarg-pointer const-delta tracker update. Single-BB, fires
-      // only for the canonical `s_add_u32 ; s_addc_u32 (hi, hi, #0)`
-      // 64-bit const-add pattern against the source-ABI kernarg-pair
-      // SGPRs (Tensile UniversalArgs: shift kernarg ptr past a 16-byte
-      // preamble before issuing the downstream static kernarg loads).
-      // Everything else that touches either dword invalidates the
-      // tracker; handle_smem.cpp then refuses the kernarg-slot fast
-      // path loudly. See `RaiseContext::KernargPtrDelta` for the full
-      // state machine and invariants, and issue #21 for the canonical
-      // miscompile this fix surfaces.
+      // Per-SGPR-dword kernarg-provenance update. Single-BB; tracks
+      // whether each SGPR dword is provably independent of the entry
+      // kernarg pointer, derived from it (Kernarg + const delta), or
+      // unknown. Recognises the canonical `s_add_u32 ; s_addc_u32
+      // (hi, hi, #0)` 64-bit const-add pattern against the source-
+      // ABI kernarg-pair SGPRs (Tensile UniversalArgs preamble
+      // shift); anything else that touches either dword falls back
+      // to Unknown and handle_smem.cpp then routes the load through
+      // the addrspace(1) global path.
       //
       // Placed here (in the generic post-handler hook rather than in
       // handle_sop2.cpp) so the update point is a single location

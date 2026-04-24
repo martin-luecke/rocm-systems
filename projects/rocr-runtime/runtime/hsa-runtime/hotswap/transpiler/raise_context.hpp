@@ -76,117 +76,31 @@ struct RaiseContext {
   // `S_SET_PC_I64` doc for the lowering shapes.
   const SetPcAnalysis *setpcAnalysis = nullptr;
 
-  // ====== Kernarg pointer const-delta tracker ==========================
+  // ====== Per-SGPR-dword kernarg provenance ============================
   //
   // The source-ABI kernarg pointer lives in an SGPR pair
   // (`userSgprLayout->kernargSegmentPtrSgpr` = low dword; the high dword
-  // is the next SGPR index). The kernel code object owns that pair at
-  // entry, and `handle_smem.cpp` routes `s_load_b*` loads whose sbase is
-  // that pair through `extractKernargDword` — reading the matching
-  // IR-level kernel argument directly instead of dereferencing the
-  // pointer. That works as long as the pair still points at the kernarg
-  // segment at the load site.
+  // is the next SGPR index). At kernel entry the raiser seeds that pair
+  // with `ptrtoint(amdgcn_kernarg_segment_ptr)`, so SMEM loads through
+  // the pair flow to the LLVM AMDGPU backend as ordinary GEP+load on
+  // `addrspace(4)` and the backend selects `s_load_*` against the
+  // kernarg segment for free. The actual pointer arithmetic the kernel
+  // performs (e.g. Tensile UniversalArgs `s_add_u32 ; s_addc_u32`) is
+  // faithfully captured in IR by the per-instruction lifts; nothing in
+  // handle_smem.cpp needs a delta-tracking pass to compute a load
+  // offset.
   //
-  // Tensile's UniversalArgs ABI breaks that invariant: it adds a small
-  // constant (typically 16 bytes) to the pair to skip a preamble before
-  // issuing the downstream kernarg reads. Without this tracker,
-  // handle_smem.cpp would route the shifted load through
-  // `extractKernargDword(imm_offset)` and silently pull kernarg bytes
-  // from offset 0 instead of offset 16 — the issue-21 miscompile.
+  // What handle_smem.cpp DOES need is an addrspace hint: when the pair
+  // still denotes a kernarg-segment pointer (entry value + a sequence of
+  // mutations the raiser proves preserve kernarg provenance) the load
+  // can use `addrspace(4)`; when the pair has been clobbered with an
+  // unrelated value (Triton/SGLang `s[0:1] = preloaded_ptr +
+  // wg_offset`, Tensile HBMArgs `s_load_b64 s[0:1], s[0:1], 0x10`)
+  // it must fall back to `addrspace(1)` so the backend can lower to
+  // VMEM (or, for uniform bases, late-promote back to SMEM). The
+  // per-dword provenance map below answers that question.
   //
-  // This tracker records the provenance of the SGPR pair that *started*
-  // life as the kernarg pointer. When the pair still denotes the kernarg
-  // segment, it also records the accumulated constant 64-bit delta from
-  // the entry value within a single basic block. The only kernarg-preserving
-  // mutation it recognises is the canonical 64-bit const-add:
-  //
-  //     s_add_u32  s[ka],   s[ka],   #K      ; low dword += K, SCC = carry
-  //     s_addc_u32 s[ka+1], s[ka+1], #0      ; high dword += 0 + carry
-  //
-  // Writes that derive from the entry kernarg pointer but cannot be folded
-  // to a single constant delta make the pair Unknown, and handle_smem.cpp
-  // refuses the kernarg-slot fast path when the tracker is Unknown (no
-  // silent fallback to reading the sentinel-seeded SGPR value). Complete
-  // overwrites from independent values, or SMEM loads that materialise both
-  // halves of the pair, make the pair NonKernarg: later `s_load_b*` through
-  // the same physical registers must lower as ordinary scalar memory.
-  //
-  // Lifetime: reset to `(delta=0, valid=true)` at the kernel entry BB and
-  // invalidated (`valid=false`) at every BB boundary in the raiser's
-  // main loop. The pair's const-delta-from-entry is a single-BB property:
-  // tracking it across a CFG merge would require phi reasoning over two
-  // possibly-different deltas (e.g. Tensile's NORMAL vs HBM branches
-  // both end at `label_LoadArgsEnd` with different kernarg-pair values).
-  // The single-BB scope is sufficient to fix the dominant NORMAL-path
-  // miscompile without opening that can of worms.
-  //
-  // State machine (updated in raiser.cpp's post-handler hook after every
-  // successfully-raised instruction that writes one of the kernarg-pair
-  // dwords):
-  //
-  //   valid=true,  pendingLow=false  (initial / post-commit)
-  //     on S_ADD_U32(lo, lo, #K):           stage pendingLowDelta=K,
-  //                                          pendingLow=true
-  //     on write to lo (other shape):       valid=false
-  //     on write to hi:                     valid=false
-  //
-  //   valid=true,  pendingLow=true
-  //     on S_ADDC_U32(hi, hi, #0):          commit delta += pendingLowDelta,
-  //                                          pendingLow=false
-  //     anything else writing lo/hi:        valid=false
-  //     anything else writing SCC:          valid=false, pendingLow=false
-  //       (SCC is the carry input to s_addc_u32; if an intervening
-  //        instruction clobbers SCC the pair's high-dword add would
-  //        carry a stale bit, breaking the 64-bit semantics.)
-  //
-  //   baseKind=Unknown  (terminal for the BB unless a later instruction
-  //     fully overwrites both halves from non-kernarg sources)
-  //     handle_smem refuses loads through the pair. BB boundary resets to
-  //     Kernarg for pristine BBs, Unknown otherwise.
-  //
-  //   baseKind=NonKernarg
-  //     the pair holds an ordinary scalar value/pointer. handle_smem must
-  //     take the normal SGPR-address path, not the kernarg extractor.
-  //
-  // The high-dword immediate MUST be exactly 0 for the pattern to fold
-  // to a single 64-bit delta: `lo + K` with `hi + 0 + carry_out` is the
-  // standard 64-bit extended-precision add only when the high-dword's
-  // additive term is zero. Any non-zero high immediate would change the
-  // high half by more than the low carry and would not fold to a clean
-  // 64-bit const delta.
-  struct KernargPtrDelta {
-    enum class BaseKind {
-      Kernarg,
-      NonKernarg,
-      Unknown,
-    };
-
-    // Whether the SGPR pair currently denotes the kernarg segment pointer,
-    // an ordinary non-kernarg value, or an unmodelled value derived from the
-    // entry kernarg pointer.
-    BaseKind baseKind = BaseKind::Kernarg;
-    // Accumulated 64-bit const delta from the kernarg-pair entry value.
-    // Meaningful only when `baseKind == Kernarg`, `valid` is true, and
-    // `pendingLow` is false.
-    int64_t delta = 0;
-    // Whether `delta` accurately reflects the pair's current value
-    // (modulo the 64-bit low/high add semantics above). Kept for the
-    // existing handler checks; false whenever `baseKind != Kernarg`.
-    bool valid = true;
-    // Low dword has been advanced by `pendingLowDelta`; high dword has
-    // not yet been matched by the complementary S_ADDC_U32(hi, hi, #0).
-    // While this is true, the pair's 64-bit value is `entry + delta +
-    // (pendingLowDelta in the low dword only)` — a torn state that
-    // must not be consumed by handle_smem. The state exists so the
-    // immediately-following S_ADDC_U32 can commit it atomically.
-    bool pendingLow = false;
-    int64_t pendingLowDelta = 0;
-  };
-  KernargPtrDelta kernargPtrDelta;
-
-  // Single-BB provenance for SGPR dwords that may carry the sentinel-modeled
-  // entry kernarg pointer. This deliberately tracks only the question the SMEM
-  // kernarg fast path needs to answer:
+  // This deliberately tracks only:
   //
   //   "Is this SGPR dword definitely independent of the entry kernarg
   //    pointer, definitely the low/high dword of that pointer plus a known
@@ -199,6 +113,19 @@ struct RaiseContext {
   // into another SGPR pair remains Kernarg-derived, so writing s[ka:ka+1]
   // from that alias cannot be mistaken for an independent non-kernarg
   // overwrite.
+  //
+  // The only kernarg-preserving in-place mutation of the pair the
+  // raiser recognises is the canonical 64-bit const-add:
+  //
+  //     s_add_u32  s[ka],   s[ka],   #K      ; low dword += K, SCC = carry
+  //     s_addc_u32 s[ka+1], s[ka+1], #0      ; high dword += 0 + carry
+  //
+  // The two instructions arrive separately on the post-handler hook, so
+  // we stage the low-dword side in `kernargPairPendingLow` /
+  // `kernargPairPendingLowDelta` and commit on the matching
+  // `s_addc_u32 (hi, hi, 0)`. Anything else that writes lo/hi (or
+  // clobbers SCC mid-stage) flips the pair's per-dword provenance to
+  // Unknown.
   struct SgprKernargProvenance {
     enum class Kind {
       Unknown,
@@ -240,7 +167,7 @@ struct RaiseContext {
     }
   }
 
-  void setKernargPairProvenance(KernargPtrDelta::BaseKind kind,
+  void setKernargPairProvenance(SgprKernargProvenance::Kind kind,
                                 int64_t delta = 0) {
     if (userSgprLayout == nullptr)
       return;
@@ -250,7 +177,7 @@ struct RaiseContext {
       return;
 
     switch (kind) {
-    case KernargPtrDelta::BaseKind::Kernarg:
+    case SgprKernargProvenance::Kind::Kernarg:
       sgprKernargProvenance[kaLo].kind =
           SgprKernargProvenance::Kind::Kernarg;
       sgprKernargProvenance[kaLo].delta = delta;
@@ -260,7 +187,7 @@ struct RaiseContext {
       sgprKernargProvenance[kaLo + 1].delta = delta;
       sgprKernargProvenance[kaLo + 1].subDword = 1;
       break;
-    case KernargPtrDelta::BaseKind::NonKernarg:
+    case SgprKernargProvenance::Kind::NonKernarg:
       sgprKernargProvenance[kaLo] = {};
       sgprKernargProvenance[kaLo].kind =
           SgprKernargProvenance::Kind::NonKernarg;
@@ -268,12 +195,23 @@ struct RaiseContext {
       sgprKernargProvenance[kaLo + 1].kind =
           SgprKernargProvenance::Kind::NonKernarg;
       break;
-    case KernargPtrDelta::BaseKind::Unknown:
+    case SgprKernargProvenance::Kind::Unknown:
       sgprKernargProvenance[kaLo] = {};
       sgprKernargProvenance[kaLo + 1] = {};
       break;
     }
   }
+
+  // Pending low-half of the canonical 64-bit const-add against the kernarg
+  // pair (`s_add_u32 lo,lo,K` staged here, committed by the matching
+  // `s_addc_u32 hi,hi,0` on the following instruction). While
+  // `kernargPairPendingLow` is true the pair's per-dword provenance is
+  // Unknown — the high half has not yet been advanced to match the
+  // carry — so any handle_smem access to the pair must take the
+  // global-fallback path. See the comment block above the
+  // `SgprKernargProvenance` struct for the full state machine.
+  bool kernargPairPendingLow = false;
+  int64_t kernargPairPendingLowDelta = 0;
 
   // Precomputed set of BB-start offsets where the kernarg pair is
   // *guaranteed* to still hold its entry-time value: i.e. there is no
@@ -283,44 +221,16 @@ struct RaiseContext {
   // Populated once in `raiser.cpp`'s Phase 4.5 pre-pass via a forward
   // dataflow over the decoded MC stream and its inferred CFG (branch
   // targets + fall-through). Consumed by
-  // `resetKernargPtrDeltaAtBBBoundary` to decide whether to reset the
-  // tracker to `valid = true, delta = 0` at a BB boundary (pristine)
-  // or to `valid = false` (the pair may have been clobbered along at
-  // least one incoming path — we do NOT do phi reasoning over
-  // potentially-divergent deltas).
-  //
-  // Why the pristine-at-BB-start dataflow is correct-and-sufficient:
-  //
-  //   (a) The raiser emits the pair's kernarg IR value inline for
-  //       every static kernarg-slot extraction via
-  //       `extractKernargDword(delta + imm)`. That extraction reads
-  //       the matching IR function argument directly rather than
-  //       dereferencing a runtime pointer, so the pair's *current*
-  //       SGPR value at the load site is only consulted via the
-  //       tracker's `delta`. If any incoming edge writes the pair,
-  //       delta may differ per edge and the tracker cannot describe
-  //       a single 64-bit constant — we refuse.
-  //
-  //   (b) For a BB where NO incoming path writes the pair (even after
-  //       several branches), the pair's entry-time value is the
-  //       unique SSA reality on every predecessor. The tracker enters
-  //       that BB with `valid = true, delta = 0`, and any subsequent
-  //       s_add_u32/s_addc_u32 pair inside the BB advances delta per
-  //       the state machine above. Crucially this covers the Tensile
-  //       UniversalArgs HBM-path BB — `label_HBMArgs` has a single
-  //       `s_load_b64 s[0:1], s[0:1], 0x10` as its only content, with
-  //       only the entry BB as predecessor (which never writes the
-  //       pair), so it enters pristine and the load extracts from
-  //       kernarg offset 0x10 correctly.
+  // `resetSgprKernargProvenanceAtBBBoundary` to decide whether to reset
+  // the kernarg pair's provenance to `Kernarg` at a BB boundary
+  // (pristine) or to `Unknown` (the pair may have been clobbered along
+  // at least one incoming path — we do NOT do phi reasoning over
+  // potentially-divergent values).
   //
   // A BB whose offset is NOT in this set is reached by at least one
-  // path that writes the pair; the tracker enters with `valid =
-  // false` and handle_smem.cpp refuses the kernarg-slot fast path on
-  // any kernarg-pair SMEM load in that BB. This is the NORMAL- and
-  // HBM-path merge point in the Tensile UniversalArgs shape (the two
-  // branches carry divergent pair values — `entry + 16` vs
-  // `*(entry + 16)`). The refusal is loud and pinpoint, per the
-  // project's "fail loudly" rule.
+  // path that writes the pair; the per-dword provenance enters as
+  // Unknown and handle_smem.cpp falls back to the addrspace(1) path on
+  // any kernarg-pair SMEM load in that BB.
   //
   // If `userSgprLayout->kernargSegmentPtrSgpr < 0` (no kernarg
   // pointer enabled in the KD), the pre-pass skips the dataflow and
@@ -328,31 +238,24 @@ struct RaiseContext {
   // be "clobbered" if it doesn't exist.
   llvm::DenseSet<uint64_t> kernargPristineBBs;
 
-  // Reset the const-delta tracker for the start of a new BB, consulting
-  // `kernargPristineBBs` to decide whether the pair is guaranteed-
-  // pristine along every incoming path.
+  // Reset the per-dword kernarg provenance state at the start of a new
+  // BB, consulting `kernargPristineBBs` to decide whether the pair is
+  // guaranteed-pristine along every incoming path.
   //
   // Called once from the raiser's main loop at every BB transition
   // (after the dataflow pre-pass has populated `kernargPristineBBs`).
   // Not called explicitly at kernel entry: the default-constructed
-  // `KernargPtrDelta{}` is already the correct entry-BB state (delta=0,
-  // valid=true) and the entry BB is unconditionally in
-  // `kernargPristineBBs`.
-  void resetKernargPtrDeltaAtBBBoundary(uint64_t bbOffset) {
+  // state is already the correct entry-BB state and the entry BB is
+  // unconditionally in `kernargPristineBBs`.
+  void resetSgprKernargProvenanceAtBBBoundary(uint64_t bbOffset) {
     if (sgprProvenanceFallthroughBBs.contains(bbOffset))
       return;
 
-    kernargPtrDelta.delta = 0;
-    kernargPtrDelta.baseKind = kernargPristineBBs.contains(bbOffset)
-                                   ? KernargPtrDelta::BaseKind::Kernarg
-                                   : KernargPtrDelta::BaseKind::Unknown;
-    kernargPtrDelta.valid =
-        kernargPtrDelta.baseKind == KernargPtrDelta::BaseKind::Kernarg;
-    kernargPtrDelta.pendingLow = false;
-    kernargPtrDelta.pendingLowDelta = 0;
+    kernargPairPendingLow = false;
+    kernargPairPendingLowDelta = 0;
     sgprKernargProvenance.assign(regs.sgpr.size(), SgprKernargProvenance{});
-    if (kernargPtrDelta.baseKind == KernargPtrDelta::BaseKind::Kernarg)
-      setKernargPairProvenance(KernargPtrDelta::BaseKind::Kernarg, 0);
+    if (kernargPristineBBs.contains(bbOffset))
+      setKernargPairProvenance(SgprKernargProvenance::Kind::Kernarg, 0);
   }
 
   // gfx1250 s_set_vgpr_msb state: only the LOW 8 bits of the instruction's
