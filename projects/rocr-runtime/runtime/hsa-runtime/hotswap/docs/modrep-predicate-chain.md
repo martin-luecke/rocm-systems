@@ -1,13 +1,37 @@
 # MODREP predicate-chain class
 
 **Status.** Option O1 (loud-refuse classifier) landed; O2 (mask
-rewrite) deferred indefinitely on semantic grounds; O3 / O4 not
-triggered. Under `WaveNativeProjection` (the default for wave32 →
-wave64 cross-widening) the class is structurally suppressed.
-Under `ModuloReplicationProjection` (opt-in via
-`--disable-wave-native` / `enableWaveNative=false`) the class is
-loud-refused by the narrow-O1 classifier in
-`transpiler/c5_predicate_chain_classifier.{hpp,cpp}`.
+rewrite) deferred indefinitely on semantic grounds; O3 is now active only as
+the analysis-selected ThreadLoop retry for the §5.6.3 explicit-readfirstlane
+SGPR-forced class. Under `WaveNativeProjection` (the default for wave32 →
+wave64 cross-widening) the class is structurally suppressed except for the
+phantom-lane sub-case.
+Under `ModuloReplicationProjection` (opt-in via `--disable-wave-native` /
+`enableWaveNative=false`) the class is loud-refused by the narrow-O1
+classifier in `transpiler/c5_predicate_chain_classifier.{hpp,cpp}`.
+
+**Boundary with the §5.6.3 cross-lane safety-net.** This document's
+C5 predicate-chain refusal is projection-dependent (suppressed under
+WaveNative except the phantom-lane sub-case, active under MODREP).
+That is distinct from the post-raise
+`rewriteCrossLaneDivergent` use-chain safety-net in
+`rewrite_cross_lane_divergent.{hpp,cpp}` (the
+`writelane/readlane-post-raise-safety-net` refusal path): that guard
+is projection-agnostic and can refuse under both WaveNative and
+MODREP when a rewritten cross-lane value reaches an SGPR-forced sink
+(for example `llvm.amdgcn.readfirstlane`).
+
+**ThreadLoop activation boundary.** The internal retry is now graduated for
+one class only: cross-widening post-raise refusals whose structured
+use-chain verdict is `ExplicitReadFirstLane`, with an integer target/source
+wave-size ratio. It is still analysis-driven and invisible to users. The
+retry lowers `readlane`, `writelane`, and explicit `readfirstlane` as
+source-wave-scoped operations and keeps the original loud refusal for shapes
+outside that proof. This is orthogonal to MODREP C5:
+`WorkitemIdPredicateChain` remains a refusal under MODREP and remains
+suppressed under WaveNative's non-phantom contract. The ThreadLoop retry
+suppresses the C5 refusal only on this narrowed route; it is not a general
+"ThreadLoop solves C5" claim.
 
 **Scope.** Wave-size axis: kernels compiled for a source wave
 width `W_s` that reach cross-widening (`W_t > W_s`) under
@@ -327,14 +351,16 @@ including sub-case 2's inactive-lane-leak (each replica runs
 serially with full EXEC, so inactive-lane VGPRs never participate
 in a gather).
 
-**Invasiveness.** The largest of the four.
-`ThreadLoopProjection` is a skeleton in
-`wave_projection.hpp`; every override `report_fatal_error`s
-pending a real implementation. Multi-week piece of work.
+**Invasiveness.** The full serial-body loop remains the largest of the four.
+The landed implementation is narrower: `ThreadLoopProjection` supplies the
+projection boundary needed by the §5.6.3 SGPR-forced route and makes
+lane-indexed primitives source-wave-scoped there. It does not claim to cover
+arbitrary scan-shaped C5 kernels by itself; those still need either the full
+loop body transform or another explicit rewrite.
 
-**Risk.** High implementation cost for no additional corpus
-coverage today. Reserved for a future recipe that demonstrably
-needs it.
+**Risk.** Bounded to the explicit-readfirstlane post-raise class by the
+activation gate. The canaries assert the MODREP C5 refusal remains intact and
+that non-trigger writelane/readlane rewrite cases stay on their existing path.
 
 ### O4. Harness-side constraint on `num_warps`
 

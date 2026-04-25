@@ -89,12 +89,17 @@ modulo-replication is the pre-graduation default and remains
 valid on the narrower class where single-replica EXEC semantics are
 faithful. §6 defines *wave-size-obliviousness* precisely and §7
 discharges it statically via a three-outcome procedure (emit /
-rewrite / refuse). Thread-loop and scalarisation are deferred rungs
-for kernels that reach outcome (c) under either projection:
-`ThreadLoopProjection` exists as a skeleton in
-`transpiler/wave_projection.hpp` with every override
-`report_fatal_error`ing until a corpus kernel demands it;
-scalarisation has no skeleton yet.
+rewrite / refuse). Thread-loop and scalarisation remain higher-obligation
+rungs for kernels that reach outcome (c) under either projection.
+`ThreadLoopProjection` now exists as an explicit, conservative projection
+surface in `transpiler/wave_projection.{hpp,cpp}` and is auto-selected only
+after the post-raise `writelane/readlane-post-raise-safety-net` proves the
+narrow SGPR-forced class: cross-widening, integer wave-size ratio, and a
+writelane/readlane result whose SSA use-chain reaches an explicit
+`llvm.amdgcn.readfirstlane` sink. That route lowers `readlane`, `writelane`,
+and explicit `readfirstlane` as source-wave-scoped operations at the
+projection boundary; it does not widen the rewrite allow-list. Scalarisation
+still has no skeleton yet.
 
 ## 3. Source model — gfx1250 wave32
 
@@ -618,13 +623,18 @@ source-wave collapse the rewrite was designed to eliminate.
 walks the transitive uses of each call's result and over-
 approximates to SGPR-forced on every user it does not recognise
 (conservative direction per the project's "refuse when uncertain"
-rule). If any site's verdict is SGPR-forced, the rewrite pass
-performs zero rewrites and populates
-`CrossLaneDivergentRewriteReport::sgprForcedDetail`; the raiser
-surfaces that detail as `crossWaveRewriteOracleDisagreement`. The
-refusal is all-or-nothing because a mix of rewritten and preserved
-sites on a shared VGPR recreates the Matmul128x128 asymmetric-
-rewrite fault pattern described above.
+rule). If any site's verdict is SGPR-forced, the rewrite pass performs zero
+rewrites and populates `CrossLaneDivergentRewriteReport::sgprForcedDetail`.
+For cross-widening with an integer wave-size ratio and an explicit
+`readfirstlane` sink, the raiser now retries under `ThreadLoopProjection`
+automatically and logs the exact trigger; that retry disables the
+writelane/readlane rewrite and instead uses source-wave-scoped lowering for
+`readlane`, `writelane`, and explicit `readfirstlane`. Other SGPR-forced
+sinks (scalar memory operands, `s_sendmsg`, inline asm, unknown calls /
+intrinsics, addrspace(4) memory) keep the original loud
+`crossWaveRewriteOracleDisagreement` refusal. The all-or-nothing rule
+remains: a mix of rewritten and preserved sites on a shared VGPR recreates
+the Matmul128x128 asymmetric-rewrite fault pattern described above.
 
 Extending the classifier is a mechanical task: a new intrinsic that
 is SGPR-forced in some operand position goes into
@@ -637,20 +647,12 @@ effectively terminal for the classifier's purposes, e.g. an MFMA
 accumulator or a memory store). Unknown intrinsics remain SGPR-
 forced until explicitly audited.
 
-The pass runs **only** when `--enable-writelane-rewrite` is passed
-on the `raise_cli` command line, plumbed through
-`PipelineConfig::enableWritelaneRewrite` / `raiseToIR`'s opt-in
-parameter. Default off. This gating is deliberate: the rewrite was
-designed around the Matmul128x128 failure mode and a narrow
-divergence-oracle contract; landing it as a *default* would
-pre-empt the empirical verification that the oracle and
-classifier stay in lockstep across the full kerneldex corpus. The
-flag exists to let callers graduate individual test surfaces
-(`tests/gfx1250_gpu_test.cpp::doTestMatmul`,
-`tests/integration_test.cpp`'s MultiKernelRaise + VecaddAllKernels
-paths) opt-in first, validate the full regression sweep under the
-new path, then flip the default globally once the oracle-classifier
-agreement is empirically established across the corpus.
+The pass runs by default (`--enable-writelane-rewrite` is retained as a
+no-op compatibility spelling; `--disable-writelane-rewrite` pins the
+pre-rewrite path for lit fixtures). The SGPR-forced ThreadLoop route is not a
+user-facing fallback knob: activation is driven solely by the structured
+rewrite-classifier refusal kind (`ExplicitReadFirstLane`) plus the
+cross-widen integer-ratio gate.
 
 Classifier coupling: under the flag, `buildObstructionReport` in
 `wave_size_obstruction.cpp` tags `WaveIdLiftScalarized` sites with
