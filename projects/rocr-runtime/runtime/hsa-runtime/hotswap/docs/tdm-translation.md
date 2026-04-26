@@ -92,8 +92,10 @@ Emit a call to the HIP-authored device runtime in
 `transpiler/runtime/tdm.hip`. Two C-linkage entry points:
 
 ```c
-void salmon_tdm_load_to_lds  (v4i g0, v8i g1, v4i g2, v4i g3);
-void salmon_tdm_store_from_lds(v4i g0, v8i g1, v4i g2, v4i g3);
+void salmon_tdm_load_to_lds  (v4i g0, v8i g1, v4i g2, v4i g3,
+                              uint32_t source_wave_size);
+void salmon_tdm_store_from_lds(v4i g0, v8i g1, v4i g2, v4i g3,
+                               uint32_t source_wave_size);
 ```
 
 Declared at IR-level by `tdm_runtime.{hpp,cpp}` and **link-merged
@@ -117,26 +119,52 @@ the authoritative spec):
   in the entry point; the rest of the walk is templated on
   `<bool IsLoad, unsigned DS>` so per-element switching
   disappears.
-- **Lane parallelism.** Lane L handles X = L, L+W, L+2W, …
-  (W = `__builtin_amdgcn_wavefrontsize()`); X is unique per
-  lane so the stripe is race-free on both the global and LDS
-  sides.
+- **Lane parallelism is source-wave-local.** Source-local lane L
+  handles X = L, L+W_src, L+2W_src, … where W_src is the source
+  wave size passed by `handle_vimage.cpp`. Under WaveNative
+  wave32 → wave64, the helper first splits the target wave into
+  lanes 0..31 and 32..63, so descriptor uniformisation and X
+  striping happen independently for each modeled source wave.
 - **EXEC gating.** The handler wraps each helper call in
   `RaiseContext::emitUnderExec`, so inactive modeled source lanes skip
   the entire descriptor walk even when the target projection keeps
   hardware EXEC widened between side-effect diamonds.
 - **Atomic-barrier side effect** (descriptor group 1 field) is gated
-  to lane 0.
+  to source-local lane 0.
 
 Field offsets track the MI450 SPG Tensor DMA Resource Descriptor
 tables (79–84).
 
-The runtime helpers take only the four D# groups. They deliberately
-drop the intrinsic's trailing `grp4_reserved` and `cpol` immediate:
-group 4 is reserved by the intrinsic contract, and `cpol` is a
-cache-policy immediate with no equivalent target encoding in the
-MUBUF-based helper path. The descriptor-visible semantics, including
-atomic-barrier updates, are encoded in the forwarded D# groups.
+The runtime helpers take the four D# groups plus the source wave size.
+They deliberately drop the intrinsic's trailing `grp4_reserved` and
+`cpol` immediate: group 4 is reserved by the intrinsic contract, and
+`cpol` is a cache-policy immediate with no equivalent target encoding
+in the MUBUF-based helper path. The descriptor-visible semantics,
+including atomic-barrier updates, are encoded in the forwarded D#
+groups.
+
+### 3.3 Projection contract
+
+TDM descriptors are SGPR operands, so the ISA/compiler contract gives
+descriptor uniformity per source wave, not per target wave. That
+distinction matters under WaveNativeProjection: one gfx942 wave64 can
+represent two gfx1250 source wave32s, and those two source waves may
+legitimately carry different descriptor groups or base pointers. A
+target-wave-global `readfirstlane` would collapse both halves to the
+first active target lane's descriptor, and using the target
+wavefront size as the X stride would start the upper source wave at
+local X=32 instead of X=0.
+
+`handle_vimage.cpp` therefore passes `source_wave_size` explicitly.
+The helper may infer `group_base = lane_id & ~(source_wave_size - 1)`
+and `local_lane = lane_id - group_base` only for the supported packed
+shapes:
+
+| Shape | Status | Reason |
+|---|---|---|
+| source wave size == target wave size | Supported | One source wave occupies one target wave; target-local and source-local are identical. |
+| source wave32 → target wave64 | Supported | WaveNative packs source wave 0 into lanes 0..31 and source wave 1 into lanes 32..63; the helper splits those regions before descriptor `readfirstlane`. |
+| all other shapes | Refused by `handle_vimage.cpp` | The helper has no proven source-wave grouping rule; trapping in the runtime would be too late and approximate emulation is forbidden. |
 
 ## 4. `S_WAIT_TENSORCNT`
 
@@ -171,6 +199,7 @@ for the sibling `S_WAIT_ASYNCCNT` posture — same rationale.
 | `TdmGpu.CrossTargetCorpus` | gtest (GPU) | Sweep `test_data/gfx1250`; lift every TDM-using HSACO; `hipModuleLoadData` on gfx942 |
 | `TdmDescriptorCoverage.DispatchDenseContiguous/{Load,Store}_{1..5}D` | gtest (GPU) | Parameterised dispatch + byte-compare for each (direction × rank) cell — functional fence on the walker |
 | `TdmGpu.LoadStoreRoundtrip5D` | gtest (GPU) | Load+store composition in one kernel, multi-wave dispatch forces workgroup LDS sync |
+| `TdmGpu.SourceWaveLocalDescriptors` | gtest (GPU) | Direct helper canary: one target wave carries two different source-wave descriptors/base pointers; load, store, and atomic-barrier side effects remain source-wave-local |
 
 GPU test fixtures live in
 `hotswap/test_data/gfx1250/tdm_{load,store,load_store}_kernel.hip`

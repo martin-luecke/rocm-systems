@@ -957,9 +957,12 @@ epic; not wave-size.
 - **Matrix (`matrix-translation.md`).** WMMA assumes EXEC=full at the
   issue site; §5.6.1's `init_whole_wave` supplies it kernel-wide on
   the wave-native path, so WMMA → MFMA lowering needs no WWM markers.
-- **Async / tensor-copy collectives.** Any future tensor-copy
-  collective lowering has the same EXEC=full requirement, satisfied
-  the same way.
+- **TDM (`tdm-translation.md`).** Cross-target
+  `tensor_{load,store}_*` emulation is source-wave-local under the
+  wave32 → wave64 WaveNative packing: descriptors are uniform per
+  source wave, not per target wave, so the helper receives the source
+  wave size and splits lanes 0..31 / 32..63 before descriptor
+  `readfirstlane` and X striping.
 - **Sync (`sync-translation.md`).** Barriers under divergent EXEC are
   wrong on every AMDGPU ISA; sync assumes SPE has already enforced
   "every wave reaches every barrier." A barrier inside an
