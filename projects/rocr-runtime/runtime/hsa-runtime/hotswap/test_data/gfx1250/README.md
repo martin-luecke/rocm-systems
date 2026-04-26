@@ -85,6 +85,9 @@ other two fixtures. Verify with `llvm-objdump -d --mcpu=gfx1250
 | `dpp_quad_perm_gfx1250.hsaco` | P5 hand-crafted regression (XOR-1 quad swap) | hipcc inline-asm | cross-lane unit | No | `v_mov_b32_dpp ... quad_perm:[1,0,3,2]` | `Gfx1250Gpu.DppQuadPerm` |
 | `ds_swizzle_gfx1250.hsaco` | P6 hand-crafted regression (XOR-2 BITMASK_PERM swizzle) | hipcc inline-asm | cross-lane unit | No | `ds_swizzle_b32 offset:swizzle(SWAP,2)` | `Gfx1250Gpu.DsSwizzle` |
 | `rcp_sqrt_gfx1250.hsaco` | `1.0f / sqrtf(x)` literal-numer div-scale fixture | hipcc | elementwise | No | `v_sqrt_f32`, `v_div_scale_f32 .., 1.0`, `v_div_fixup_f32 .., 1.0` | `Gfx1250Gpu.RcpSqrt` |
+| `tdm_load_gfx1250.hsaco`  | Parameterised tensor_load_to_lds (up-to-5D D#) | hipcc builtin | TDM memory | No | `tensor_load_to_lds` (`_d4` form) | `TdmDescriptorCoverage.DispatchDenseContiguous/Load_*` |
+| `tdm_store_gfx1250.hsaco` | Parameterised tensor_store_from_lds (up-to-5D D#) | hipcc builtin | TDM memory | No | `tensor_store_from_lds` (`_d4` form) | `TdmDescriptorCoverage.DispatchDenseContiguous/Store_*` |
+| `tdm_load_store_gfx1250.hsaco` | 5D tensor load+store roundtrip through LDS | hipcc builtin | TDM memory | No | `tensor_load_to_lds`, `tensor_store_from_lds`, `s_wait_tensorcnt` | `TdmGpu.LoadStoreRoundtrip5D` |
 
 ## What these exercise (and what they don't)
 
@@ -100,9 +103,9 @@ other two fixtures. Verify with `llvm-objdump -d --mcpu=gfx1250
 - `s_cvt_f32_u32` / `s_cvt_u32_f32` — scalar type conversions
 - `s_mul_f32` / `s_mul_u64` — scalar FP and 64-bit multiply
 - `s_setreg_imm32_b32` with `HW_REG_WAVE_MODE` — wave32 mode setting
+- **TDM** (Tensor Data Mover): `tensor_load_to_lds`, `tensor_store_from_lds`, `s_wait_tensorcnt`
 
 ### NOT covered (requires gluon kernels)
-- **TDM** (Tensor Data Mover): `async_load`, `prefetch`, `async_wait`
 - **Cluster operations**: `cluster_arrive`, `cluster_wait`
 - **Warp specialization / warp pipeline**
 - **MXFP data types** (e2m1, float8_e4m3 with scale)
