@@ -79,8 +79,8 @@ other two fixtures. Verify with `llvm-objdump -d --mcpu=gfx1250
 |------|--------|--------|------|------|------------------|-------|
 | `vecadd_gfx1250.hsaco` | fp16 vector add | Triton | elementwise | No | `global_load_u16`, `v_add_f16`, `global_store_b16` | `Gfx1250Gpu.Vecadd` |
 | `matmul_f16_gfx1250.hsaco` | fp16 GEMM 64×64×32, 4 warps | Triton | matmul | **Yes** | `v_wmma_f32_16x16x32_f16`, `ds_load_tr16_b128` | `Gfx1250Gpu.Matmul64x64` |
-| `matmul_f16_large_gfx1250.hsaco` | fp16 GEMM 128×128×32, 8 warps | Triton | matmul | **Yes** | `v_wmma_f32_16x16x32_f16`, `v_bitop3_b32`, `s_set_vgpr_msb` | `Gfx1250Gpu.Matmul128x128*` (XFAIL) |
-| `softmax_gfx1250.hsaco` | fused row softmax 1024 cols | Triton | reduction | No | `v_pk_add_f32`, `v_permlanex16_b32`, `v_exp_f32` | `Gfx1250Gpu.Softmax` |
+| `matmul_f16_large_gfx1250.hsaco` | fp16 GEMM 128×128×32, 8 warps | Triton | matmul | **Yes** | `v_wmma_f32_16x16x32_f16`, `v_bitop3_b32`, `s_set_vgpr_msb` | `Gfx1250Gpu.Matmul128x128*` |
+| `softmax_gfx1250.hsaco` | fused row softmax 1024 cols | Triton | reduction | No | `v_pk_add_f32`, `v_permlanex16_b32`, `v_exp_f32` | `Gfx1250Gpu.Softmax` (XFAIL) |
 | `permlane16_swap_gfx1250.hsaco` | P4 hand-crafted regression (XOR-16 swap) | hipcc inline-asm | cross-lane unit | No | `v_permlane16_swap_b32_e32` | `Gfx1250Gpu.Permlane16Swap` |
 | `dpp_quad_perm_gfx1250.hsaco` | P5 hand-crafted regression (XOR-1 quad swap) | hipcc inline-asm | cross-lane unit | No | `v_mov_b32_dpp ... quad_perm:[1,0,3,2]` | `Gfx1250Gpu.DppQuadPerm` |
 | `ds_swizzle_gfx1250.hsaco` | P6 hand-crafted regression (XOR-2 BITMASK_PERM swizzle) | hipcc inline-asm | cross-lane unit | No | `ds_swizzle_b32 offset:swizzle(SWAP,2)` | `Gfx1250Gpu.DsSwizzle` |
