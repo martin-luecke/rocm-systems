@@ -200,9 +200,10 @@ for the sibling `S_WAIT_ASYNCCNT` posture — same rationale.
 | `TdmDescriptorCoverage.DispatchDenseContiguous/{Load,Store}_{1..5}D` | gtest (GPU) | Parameterised dispatch + byte-compare for each (direction × rank) cell — functional fence on the walker |
 | `TdmGpu.LoadStoreRoundtrip5D` | gtest (GPU) | Load+store composition in one kernel, multi-wave dispatch forces workgroup LDS sync |
 | `TdmGpu.SourceWaveLocalDescriptors` | gtest (GPU) | Direct helper canary: one target wave carries two different source-wave descriptors/base pointers; load, store, and atomic-barrier side effects remain source-wave-local |
+| `TdmGpu.SourceWaveDivergentFixture` | gtest (GPU) | End-to-end gfx1250 fixture: two source wave32s issue separate TDM loads with different descriptors before lifting to gfx942 |
 
 GPU test fixtures live in
-`hotswap/test_data/gfx1250/tdm_{load,store,load_store}_kernel.hip`
+`hotswap/test_data/gfx1250/tdm_{load,store,load_store,source_wave_load}_kernel.hip`
 with their compiled `.hsaco` siblings; each fixture's header
 comment contains the full regen recipe.
 

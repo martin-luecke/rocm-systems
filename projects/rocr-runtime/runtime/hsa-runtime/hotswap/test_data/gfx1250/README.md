@@ -88,6 +88,7 @@ other two fixtures. Verify with `llvm-objdump -d --mcpu=gfx1250
 | `tdm_load_gfx1250.hsaco`  | Parameterised tensor_load_to_lds (up-to-5D D#) | hipcc builtin | TDM memory | No | `tensor_load_to_lds` (`_d4` form) | `TdmDescriptorCoverage.DispatchDenseContiguous/Load_*` |
 | `tdm_store_gfx1250.hsaco` | Parameterised tensor_store_from_lds (up-to-5D D#) | hipcc builtin | TDM memory | No | `tensor_store_from_lds` (`_d4` form) | `TdmDescriptorCoverage.DispatchDenseContiguous/Store_*` |
 | `tdm_load_store_gfx1250.hsaco` | 5D tensor load+store roundtrip through LDS | hipcc builtin | TDM memory | No | `tensor_load_to_lds`, `tensor_store_from_lds`, `s_wait_tensorcnt` | `TdmGpu.LoadStoreRoundtrip5D` |
+| `tdm_source_wave_load_gfx1250.hsaco` | Two source wave32s load from distinct TDM descriptors/base pointers | hipcc builtin | TDM memory | No | `tensor_load_to_lds`, `s_wait_tensorcnt` | `TdmGpu.SourceWaveDivergentFixture` |
 
 ## What these exercise (and what they don't)
 
