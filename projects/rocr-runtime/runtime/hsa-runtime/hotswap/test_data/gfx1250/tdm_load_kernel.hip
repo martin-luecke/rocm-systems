@@ -2,11 +2,8 @@
 // exercises the `tensor_load_to_lds` TDM emulation across arbitrary
 // Tensor Descriptor dimensionality (1D through 5D).
 //
-// Unlike `tdm_smoke_kernel.hip` (1D-only, groups 2/3 encoded as zero
-// VGPRs — reaches the helper with all-zero groups 2/3 and triggers
-// the zero-bound walker contract), this kernel reads all four D#
-// groups from host-provided pointers so the test harness can build
-// any D# shape the walker supports:
+// This fixture reads all four D# groups from host-provided pointers
+// so the test harness can build any D# shape the walker supports:
 //
 //   * 1D: tensor_dim0 = T0, tensor_dim1..4 = 0, tile_dim0 = T0,
 //         tile_dim1..4 = 0.
@@ -29,9 +26,9 @@
 // bit pattern the host put in `*g{2,3}_ptr`, which is how the test
 // drives the walker's higher-dim branches.
 //
-// See `tdm_smoke_kernel.hip` for the hipcc + byte-patch regen recipe
-// — same steps, just replace the filename. Kernel symbol is
-// `tdm_load_kernel` (visible via `nm -D tdm_load_gfx1250.hsaco`).
+// Regenerate with the same hipcc + byte-patch workflow documented in
+// `tdm_load_store_kernel.hip`, replacing the filename. Kernel symbol
+// is `tdm_load_kernel` (visible via `nm -D tdm_load_gfx1250.hsaco`).
 
 #include <hip/hip_runtime.h>
 #include <cstdint>

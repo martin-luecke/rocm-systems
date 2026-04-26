@@ -59,10 +59,10 @@
 // emits a call to `salmon_tdm_load_to_lds` / `salmon_tdm_store_from_lds`
 // with the same operand vectors the same-target intrinsic emit
 // produces; the link merge happens in `raiseToIR` (see `tdm_runtime.hpp`
-// and `raiser.cpp`). The helper is wave-parallel across the first 32
-// hardware lanes (matching wave32 issuance on the source ISA) and
-// implements the full D# walk (4D/5D loops, OOB rules, padding,
-// iteration, gather mode, atomic-barrier side effect).
+// and `raiser.cpp`). The helper stripes the descriptor's innermost X
+// dimension across the target hardware wave lanes and implements the
+// full D# walk (4D/5D loops, OOB rules, padding, iteration, gather
+// mode, atomic-barrier side effect).
 //
 // When the transpiler was built without hipcc, `tdmRuntimeAvailable()`
 // is false and this handler keeps the pre-existing loud refusal path
@@ -275,9 +275,13 @@ HandlerResult handleVIMAGE(RaiseContext &ctx, const DecodedInst &di,
   FunctionCallee helper = (sop == SemOp::TENSOR_LOAD_TO_LDS)
                               ? declareTDMLoad(ctx.M)
                               : declareTDMStore(ctx.M);
-  // The runtime helper's signature is the four D# groups only —
-  // it deliberately does NOT take the intrinsic's trailing
-  // `<8 x i32> grp4` (reserved) or `i32 cpol` arguments because
+  // The runtime helper's signature is the four D# groups only. It
+  // deliberately does NOT take the intrinsic's trailing `<8 x i32>
+  // grp4` because that group is reserved by the gfx1250 intrinsic
+  // contract, and it does not take `i32 cpol` because the cross-target
+  // helper has no target cache-policy encoding to preserve. The
+  // descriptor-visible side effects, including atomic-barrier updates,
+  // live in the D# groups that are forwarded.
   ctx.B.CreateCall(helper,
                    {args.grp0, args.grp1, args.grp2, args.grp3});
   hr.handled = true;

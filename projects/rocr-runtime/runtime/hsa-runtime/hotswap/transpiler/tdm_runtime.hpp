@@ -37,12 +37,11 @@ inline constexpr llvm::StringRef kTDMStoreSymbol = "salmon_tdm_store_from_lds";
 // the four D# groups the emulation walk actually reads:
 //   void(<4 x i32>, <8 x i32>, <4 x i32>, <4 x i32>)
 // The gfx1250 LLVM intrinsic's trailing `<8 x i32> grp4` (reserved) and
-// `i32 cpol` arguments are deliberately NOT forwarded — the walker does
-// not consume them, carrying them through would only bloat the helper's
-// IR prologue, and `marshalTDMArgs` in `handle_vimage.cpp` still
-// produces the full six-tuple for the same-target intrinsic emit, so
-// the elision is localised to the cross-target `CreateCall` in the
-// handler.
+// `i32 cpol` arguments are deliberately NOT forwarded. Group 4 has no
+// architectural meaning for gfx1250, and cpol is a cache-policy immediate
+// with no equivalent target encoding in the helper's MUBUF-based lowering.
+// The descriptor-visible semantics, including atomic-barrier updates, live
+// in the D# groups passed here.
 llvm::FunctionCallee declareTDMLoad(llvm::Module &M);
 llvm::FunctionCallee declareTDMStore(llvm::Module &M);
 

@@ -26,9 +26,12 @@ global memory into/out of LDS, synchronised via its own
 `IntrinsicsAMDGPU.td:4213`), and the `TENSORcnt` register are all
 gated `isGFX125xOnly`. gfx942 has no TDM unit, no matching
 intrinsic, and no direct analog in VMUBUF/VIMAGE — a cross-target
-lift via the intrinsic fails at isel. Triton's gluon kernels and
-every GPT-OSS gfx1250 kernel that prefetches via TDM hit this on
-their first load.
+lift via the intrinsic fails at isel. The known producers today are
+the upstream AMD Gluon TDM-pipelined GEMM examples and any future
+compiler path that chooses VIMAGE TDM; the current captured GPT-OSS
+MoE `_matmul_ogs` kernels use the sibling FLAT
+`global_load_async_to_lds_b*` path documented in
+`async-copy-translation.md`.
 
 ## 2. SemOp canonicalisation
 
@@ -118,17 +121,18 @@ the authoritative spec):
   (W = `__builtin_amdgcn_wavefrontsize()`); X is unique per
   lane so the stripe is race-free on both the global and LDS
   sides.
-- **Atomic-barrier side effect** (the `cpol` barrier bit) is
-  gated to lane 0.
+- **Atomic-barrier side effect** (descriptor group 1 field) is gated
+  to lane 0.
 
 Field offsets track the MI450 SPG Tensor DMA Resource Descriptor
 tables (79–84).
 
-The runtime helpers take only the four D# groups — they
-deliberately drop the intrinsic's trailing `grp4_reserved` and
-`cpol` immediate. `cpol`'s observable effects (cachepolicy,
-`atomic_barrier`) are folded into the helper body directly; the
-reserved group 4 has no runtime meaning.
+The runtime helpers take only the four D# groups. They deliberately
+drop the intrinsic's trailing `grp4_reserved` and `cpol` immediate:
+group 4 is reserved by the intrinsic contract, and `cpol` is a
+cache-policy immediate with no equivalent target encoding in the
+MUBUF-based helper path. The descriptor-visible semantics, including
+atomic-barrier updates, are encoded in the forwarded D# groups.
 
 ## 4. `S_WAIT_TENSORCNT`
 
@@ -157,8 +161,8 @@ for the sibling `S_WAIT_ASYNCCNT` posture — same rationale.
 
 | Test | Kind | What it pins |
 |---|---|---|
-| `lit_tests/tensor_load_to_lds_d{2,4}/*.ll` | Lit (no GPU) | Cross-target helper-call emission + same-target intrinsic emit for each form |
-| `lit_tests/tensor_store_from_lds_d{2,4}/*.ll` | Lit (no GPU) | Same, store direction |
+| `lit_tests/tensor_load_to_lds.s` | Lit (no GPU) | Cross-target helper-call emission + same-target intrinsic emit for representative `_d2` load |
+| `lit_tests/tensor_store_from_lds.s` | Lit (no GPU) | Cross-target helper-call emission for representative `_d2` store |
 | `TdmRuntime.LinkerWiring` | gtest (no GPU) | Embedded bitcode parses and both helper bodies materialise |
 | `TdmGpu.CrossTargetCorpus` | gtest (GPU) | Sweep `test_data/gfx1250`; lift every TDM-using HSACO; `hipModuleLoadData` on gfx942 |
 | `TdmDescriptorCoverage.DispatchDenseContiguous/{Load,Store}_{1..5}D` | gtest (GPU) | Parameterised dispatch + byte-compare for each (direction × rank) cell — functional fence on the walker |
@@ -181,8 +185,8 @@ aborts with `Unsupported instruction: v_illegal`.
 
 Two workarounds, one per fixture class:
 
-- **Lit fixtures** (`lit_tests/tensor_*_d{2,4}/*.hip`) emit the
-  12 bytes by hand via `asm volatile(".long 0x…")`.
+- **Lit fixtures** (`lit_tests/tensor_*.s`) emit the 12 bytes by hand
+  with `.long` directives in checked-in ASM-lit sources.
 - **Dispatchable fixtures**
   (`test_data/gfx1250/tdm_{load,store,load_store}_kernel.hip`)
   use the hipcc builtin and then byte-patch the compiled `.hsaco`

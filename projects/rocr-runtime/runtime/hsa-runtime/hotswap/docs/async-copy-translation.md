@@ -15,13 +15,12 @@
 > **Scope of this document.**  The FLAT 1-D per-lane async DMA and
 > its wait counter.  The sibling VIMAGE TENSOR descriptor-driven
 > family (`TENSOR_LOAD_TO_LDS` / `TENSOR_STORE_FROM_LDS` plus
-> `S_WAIT_TENSORCNT`) is still cross-target-refused — its
-> descriptor encoding has no analog on gfx942 and a correct
-> decomposition is tracked separately from this FLAT async-copy path.
-> `S_WAIT_TENSORCNT` is pre-registered as a SemOp with a no-op
-> handler so that when the TENSOR emulation lands on the same
-> posture as this one, the wait-counter canonicalisation is
-> already in place.
+> `S_WAIT_TENSORCNT`) is handled separately in
+> `tdm-translation.md`: cross-target lifts call a link-merged
+> HIP-authored helper that walks the Tensor Descriptor over gfx942's
+> MUBUF unit. `S_WAIT_TENSORCNT` remains a SemOp with a no-op handler
+> because the cross-target helper completes synchronously before the
+> wait site.
 >
 > **North Star.**  The four GPT-OSS MoE expert-GEMM kernels
 > (`_matmul_ogs_06d912ce88af`, `_matmul_ogs_0af655e6ea2b`,

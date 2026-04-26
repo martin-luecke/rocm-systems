@@ -77,10 +77,9 @@
 //   aborts. The sibling `tdm_load_kernel.hsaco` and
 //   `tdm_store_kernel.hsaco` were generated with the same patch —
 //   this is the documented workaround from
-//   `lit_tests/tensor_load_to_lds_d2/tensor_load_to_lds_d2.hip`
-//   (same disassembler disagreement, different workaround there
-//   because those lit fixtures use raw `.long` encodings instead
-//   of the hipcc builtin).
+//   `transpiler/lit_tests/tensor_load_to_lds.s` (same disassembler
+//   disagreement, different fixture shape because ASM-lit sources use
+//   raw `.long` encodings instead of the hipcc builtin).
 //
 //   The patch rewrites dword1 of each TENSOR op from
 //   `0x00000000` to `0x7C000000` (adds the NULL sentinel in

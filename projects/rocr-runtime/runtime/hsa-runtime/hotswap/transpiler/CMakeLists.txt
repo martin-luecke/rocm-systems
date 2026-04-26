@@ -62,7 +62,7 @@ add_definitions(${LLVM_DEFINITIONS})
 # gfx942 and embed the bytes via `cmake/EmbedBinary.cmake`. The transpiler
 # parses and link-merges the bitcode into each raised IR module that uses
 # the cross-target VIMAGE TENSOR helper (see `tdm_runtime.{hpp,cpp}` and
-# `raiser.cpp` Phase 6.5). When hipcc is missing the embedded blob is
+# `raiser.cpp` Phase 6.7). When hipcc is missing the embedded blob is
 # empty (one-byte stub in tdm_runtime.cpp), `tdmRuntimeAvailable()`
 # returns false, and the cross-target VIMAGE handler keeps today's loud
 # refusal. This preserves the no-hipcc build behaviour exactly.
@@ -280,6 +280,7 @@ set(TEST_SOURCES
   tests/kernarg_layout_test.cpp
   tests/mc_context_inline_srcmgr_test.cpp
   tests/mxfp4_dequant_test.cpp
+  tests/tdm_gpu_test.cpp
   tests/wave_projection_test.cpp
 )
 
@@ -299,7 +300,6 @@ if(hip_FOUND)
     tests/cross_arch_gpu_test.cpp
     tests/divergent_exec_gpu_test.cpp
     tests/divergent_vgpr_gpu_test.cpp
-    tests/tdm_gpu_test.cpp
   )
   message(STATUS "GPU tests enabled (HIP found)")
 else()
