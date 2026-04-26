@@ -158,7 +158,8 @@ Out of scope for this fix: the remaining Triton tutorials in salmon
 mode (02 fused-softmax HANG, 04 low-memory-dropout FAIL, 05
 layer-norm HANG, 07 extern-functions FAIL, 08 grouped-gemm FAIL).
 None reproduce the R1 SIGSEGV pattern; each is a separate
-translation gap in the per-axis docs (matrix, sync, TDM, …).
+translation gap in the per-axis docs (matrix, sync, async /
+tensor-copy follow-up work, …).
 
 ## 7. Where this lives in the code
 

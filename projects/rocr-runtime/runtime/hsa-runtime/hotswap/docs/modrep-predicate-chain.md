@@ -638,7 +638,12 @@ against `gfx1250 → gfx942` cross-widening, WaveNative default):
 
 `ctest` + `llvm-lit`: no regressions introduced by the landed
 design. `BatchRaise.AiterGfx950`: raise rate unchanged.
-`Gfx1250Gpu.Matmul128x128_1tile`: unchanged under WaveNative.
+Historical note: this originally left
+`Gfx1250Gpu.Matmul128x128_1tile` unchanged under WaveNative. That is
+no longer the current result: the Matmul128 family graduated after the
+V_CMP → V_CNDMASK per-lane-i1 shadow fix documented in
+`learnings.md` (2026-04-21), and Matmul tests are no longer listed in
+`transpiler/tests/xfail.cmake`.
 
 ### 7.4 Repro
 

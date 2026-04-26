@@ -17,7 +17,7 @@
 > family (`TENSOR_LOAD_TO_LDS` / `TENSOR_STORE_FROM_LDS` plus
 > `S_WAIT_TENSORCNT`) is still cross-target-refused — its
 > descriptor encoding has no analog on gfx942 and a correct
-> decomposition requires the work tracked in `tdm-translation.md`.
+> decomposition is tracked separately from this FLAT async-copy path.
 > `S_WAIT_TENSORCNT` is pre-registered as a SemOp with a no-op
 > handler so that when the TENSOR emulation lands on the same
 > posture as this one, the wait-counter canonicalisation is
@@ -372,7 +372,7 @@ direct.
   revisiting — but the trade-off is explicit in the code and
   this doc.
 * **VIMAGE TENSOR cross-target remains refused.**  That family
-  is tracked in `tdm-translation.md` and is out of scope here.
+  is tracked separately and is out of scope here.
   The `S_WAIT_TENSORCNT` SemOp is pre-registered with a no-op
   handler so the future TENSOR emulation can follow the same
   wait-counter posture this one landed.
@@ -389,13 +389,12 @@ direct.
   `s_wait_xcnt` has to become a real dependency in the IR");
   we take the opposite direction here (no native lowering, so
   the wait stays a no-op).
-* **TDM (`tdm-translation.md`):**  the FLAT async family
+* **Tensor-descriptor async copies:** the FLAT async family
   documented here is the 1-D per-lane sibling of the
-  descriptor-driven 2-D / 4-D tile ops in
-  `tdm-translation.md`.  The FLAT arm lifts now; the TDM arm
-  does not.  `S_WAIT_TENSORCNT` is canonicalised as part of
-  this change so that TDM, when it lands, inherits the same
-  wait-counter posture.
+  descriptor-driven 2-D / 4-D tile ops. The FLAT arm lifts now; the
+  tensor-descriptor arm does not. `S_WAIT_TENSORCNT` is canonicalised
+  as part of this change so future tensor-copy emulation inherits the
+  same wait-counter posture.
 * **Cross-cutting capability dispatch
   (`target-capability-dispatch.md`):**  the per-arm split in
   `handle_flat.cpp` is a literal instance of the project-wide

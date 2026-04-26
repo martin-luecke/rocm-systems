@@ -445,8 +445,10 @@ for wave32 → wave64 cross-widening; `ModuloReplicationProjection`
 is the fallback selected by `--disable-wave-native` or
 `enableWaveNative=false`. See `hotswap/docs/modrep-predicate-chain.md`
 §6 "Picked: WaveNative as default" for the empirical evidence
-(swiglu_fp32 WRONG → match 4/4; corpus_layernorm_fp32 partial-match
-with 20×–80× smaller error; no lit/ctest/BatchRaise regressions) and
+(the C5 examples are loud-refused under MODREP and match under the
+default WaveNative evidence, including `canary_bpermute_scan_fp32`,
+`swiglu_fp32`, `rmsnorm_fp32`, and `corpus_layernorm_fp32`; no
+lit/ctest/BatchRaise regressions) and
 `transpiler/raiser.hpp`'s `enableWaveNative` parameter docstring for
 the programmatic toggle.
 
@@ -955,9 +957,9 @@ epic; not wave-size.
 - **Matrix (`matrix-translation.md`).** WMMA assumes EXEC=full at the
   issue site; §5.6.1's `init_whole_wave` supplies it kernel-wide on
   the wave-native path, so WMMA → MFMA lowering needs no WWM markers.
-- **TDM (`tdm-translation.md`).** TDM instructions are wave-level
-  collectives with the same EXEC=full requirement, satisfied the same
-  way.
+- **Async / tensor-copy collectives.** Any future tensor-copy
+  collective lowering has the same EXEC=full requirement, satisfied
+  the same way.
 - **Sync (`sync-translation.md`).** Barriers under divergent EXEC are
   wrong on every AMDGPU ISA; sync assumes SPE has already enforced
   "every wave reaches every barrier." A barrier inside an

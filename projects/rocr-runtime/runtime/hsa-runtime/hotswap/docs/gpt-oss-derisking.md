@@ -648,11 +648,11 @@ design docs:
   barriers), waitcnt, memory scopes on atomics, cache ops, cluster sync.
 - `hotswap/docs/matrix-translation.md` — WMMA → MFMA lowering framework,
   per-shape fragment-layout tables, MXFP scaled path.
-- `hotswap/docs/tdm-translation.md` — tensor descriptor emulation,
-  async_copy lowering, prefetch.
+- Tensor descriptor / async-copy follow-up work — tensor descriptor
+  emulation, async-copy lowering, prefetch.
 
 Each doc specifies its own decision procedure and refuses kernels that
 fall outside the translation framework. The GPT-OSS corpus is clean on
-the wave-size axis (this report) but depends on matrix, sync, and ABI
-axes landing before it runs end-to-end; TDM is required for the MXFP
-Gluon path captured in §8.
+the wave-size axis (this report) but depends on matrix, sync, ABI, and
+tensor-copy follow-up work before it runs end-to-end; descriptor-driven
+tensor copies are required for the MXFP Gluon path captured in §8.

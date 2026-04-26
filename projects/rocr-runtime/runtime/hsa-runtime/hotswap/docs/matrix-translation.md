@@ -513,7 +513,8 @@ through scaled-WMMA.
 End-to-end lift of the two corpus matmul_ogs kernels
 (`_matmul_ogs_06d912ce88af`, `_matmul_ogs_0af655e6ea2b`) still blocks
 on pending **Template A** (BF16 16×16×32 WMMA → MFMA; see §T2) and on
-**TDM** (`global_load_async_to_lds_*`, landed separately). Those
+async copy / tensor data movement (`global_load_async_to_lds_*`,
+landed separately). Those
 kernels emit 64× `v_cvt_scale_pk8_bf16_fp4` + 64× `v_wmma_f32_16x16x32_bf16`
 + N× `global_load_async_to_lds_*` each; this work clears the first of
 those three blockers, and the kernel raise will surface the other two
@@ -656,6 +657,12 @@ T5 in parallel. T3, then T4.
   element-wise otherwise.
 
 ## 12. Staging state — ModuloReplicationProjection-aware lowering (2026-04-22)
+
+> **Current-state note:** this section records the Session 5/6 staging
+> state. Later Session 8 work (see below) dropped the WMMA refusal
+> gates and reports `matmul_fp16` and `matmul_fp16_16x16` matching.
+> Treat the "staged-but-gated-off" language in this section as the
+> historical state before that follow-up.
 
 > **Status:** infrastructure landed, lowering staged-but-gated-off.
 > Independent of the WMMA lowering, a prerequisite ABI bug in the
@@ -1498,7 +1505,8 @@ audit / bisection only.
 | `matmul_fp16_16x16`                        | 5/5 match (gated) | 5/5 match |
 | `canary_tl_sort_fp32`                      | 1/1 match (via rewrite) | 1/1 match (no rewrite needed) |
 | `canary_tl_sort_fp32_deterministic`        | 1/1 match (via rewrite) | 1/1 match |
-| `canary_tl_sort_fp32_n16*` (7 variants)    | 7/7 match      | 7/7 match |
+| `canary_tl_sort_fp32_n16` (random input)   | WRONG 1056/8192 | WRONG 1056/8192 (open; orthogonal to the cross-16 fix) |
+| deterministic `canary_tl_sort_fp32_n16_*` variants | match | match |
 | `canary_tl_topk_{bf16,fp32}`               | 2/2 match      | 2/2 match |
 | `canary_pairsort1_fp32_n16_nw2_r32`        | 1/1 match      | 1/1 match |
 
@@ -1542,10 +1550,10 @@ Regression guards landed with the fix:
   SPE-compatible decomposition — it runs both wave32 replicas of the
   source fragment independently, which is exactly the modulo-
   replication projection SPE uses.
-- **TDM** (`tdm-translation.md`): MFMA operands arrive through LDS
-  in most GEMMs. TDM-based LDS filling is a predecessor concern —
-  matrix translation assumes the operands are in VGPRs at the
-  moment of the MFMA call, however they got there.
+- **Async copy / tensor data movement:** MFMA operands arrive through
+  LDS in most GEMMs. Descriptor-driven LDS filling is a predecessor
+  concern; matrix translation assumes the operands are in VGPRs at
+  the moment of the MFMA call, however they got there.
 - **Sync** (`sync-translation.md`): No matrix-specific sync concerns.
   The accumulator chain across a K-loop is an IR-level dataflow
   dependence; the backend emits the needed waitcnt.
