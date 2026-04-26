@@ -350,6 +350,21 @@ direct.
   align 1, plus the same-target b8 intrinsic call.  The b8 case
   is therefore no longer covered only by inspection of the
   width switch in `handle_flat.cpp`.
+* **Numerical-correctness probe still open.**  A lift-only
+  GTest is now in CI, but no native-vs-salmon numerical gate
+  exists for a real `_matmul_ogs_*` consumer.  Best-effort probe
+  status: `tools/compare_correctness/kernels/triton/` has no
+  `_matmul_ogs` recipe; the documented `~/anush_am/...`
+  `triton_kernels` source path is absent on this checkout; the
+  local Triton tree exposes the much larger `_matmul` /
+  `_p_matmul` implementations whose captured specialisations
+  require dozens of pointer, optional, scalar, and constexpr
+  arguments plus metadata tensors.  Driving one captured
+  `_matmul_ogs_*` shape through `compare_correctness` would
+  therefore require a dedicated harness/schema effort, not a
+  small async-copy audit patch.  The existing hand-authored
+  `matmul_fp16` recipes remain useful `tl.dot` probes, but they
+  are not the captured async-copy consumers.
 * **cpol `th` / `scope` bits silently dropped.**  Per §3.4,
   these are tuning hints without a gfx942 equivalent.  If a
   future corpus kernel turns out to depend on them for
