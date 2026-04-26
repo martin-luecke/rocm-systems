@@ -47,8 +47,8 @@
 ; Invalidation is not directly observable in the raised IR (it is a
 ; raise-time C++ DenseMap::erase call that leaves no IR artefact).
 ; What IS observable is its consequence: the cndmask's mask source
-; goes through the full `extractLaneBitFromWaveMask` chain because
-; the shadow lookup returned null. Pin the extract chain
+; goes through the full `extractLaneBitFromWaveMask` chain and the
+; current shadow-selection guard. Pin the extract chain
 ; identifiers (`mask_lane_idx` / `mask_at_lane` / `mask_lane_bit` /
 ; `mask_lane_i1`) — these are the names emitted by
 ; `ModuloReplicationProjection::extractLaneBitFromWaveMask` in
@@ -100,7 +100,8 @@
 ; would flow directly into the select; the invalidation correctly
 ; prevents that here because by the time of the cndmask, `s4` no
 ; longer carries the original compare's wave mask.
-; CHECK: %cndmask = select i1 %mask_lane_i1{{[0-9]*}}, i32 1065353216, i32 -1082130432
+; CHECK: %sgpr_mask_shadow_sel = select i1 false, i1 %mask_lane_i1{{[0-9]+}}, i1 %mask_lane_i1{{[0-9]*}}
+; CHECK-NEXT: %cndmask = select i1 %sgpr_mask_shadow_sel, i32 1065353216, i32 -1082130432
 
 ; NEGATIVE: the fused / direct-i1 shape must NOT be taken here. The
 ; absence of `select i1 %vcmpf, ...` in the clobber kernel is the

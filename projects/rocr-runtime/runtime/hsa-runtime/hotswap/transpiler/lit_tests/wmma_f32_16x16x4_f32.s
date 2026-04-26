@@ -148,7 +148,7 @@
 ; RUN:   && %raise_cli %t.hsaco \
 ; RUN:     --target-isa=gfx942 --disable-wave-native \
 ; RUN:     --emit-ir=wmma_f32_16x16x4_f32_kernel 2>/dev/null \
-; RUN:   | %FileCheck %s
+; RUN:   | %FileCheck %s --check-prefix=MODREP
 ;
 ; K=4 WMMA cross-target lift — MODULOREPLICATION regression pin.
 ; Runs the same `.co` as `wmma_f32_16x16x4_f32.ll` but with
@@ -208,10 +208,10 @@
 ;      (the MFMA would execute under the source-active EXEC
 ;      mask, leaving the phantom lanes' MFMA inputs undef).
 
-; CHECK-LABEL: define amdgpu_kernel void @wmma_f32_16x16x4_f32_kernel(
+; MODREP-LABEL: define amdgpu_kernel void @wmma_f32_16x16x4_f32_kernel(
 
 ; Exactly one MFMA call — MODREP is single-source-wave.
-; CHECK: call <4 x float> @llvm.amdgcn.mfma.f32.16x16x4f32(float %{{[^,]+}}, float %{{[^,]+}}, <4 x float> %{{[^,]+}}, i32 0, i32 0, i32 0)
+; MODREP: call <4 x float> @llvm.amdgcn.mfma.f32.16x16x4f32(float %{{[^,]+}}, float %{{[^,]+}}, <4 x float> %{{[^,]+}}, i32 0, i32 0, i32 0)
 
 ; MODREP-specific strict.wwm wrap around the MFMA result.  The
 ; projection-specific WWM bracket (`wrapAsWWMValue`) substitutes
@@ -219,22 +219,22 @@
 ; regression that loses both would ship a silently miscompiled
 ; kernel (the MFMA would execute under the source-active EXEC
 ; mask, leaving the phantom lanes' MFMA inputs undef).
-; CHECK: call {{.*}} @llvm.amdgcn.strict.wwm
+; MODREP: call {{.*}} @llvm.amdgcn.strict.wwm
 
 ; Exactly one MFMA call (anchored AFTER the positive check).
-; CHECK-NOT: call <4 x float> @llvm.amdgcn.mfma.f32.16x16x4f32(
+; MODREP-NOT: call <4 x float> @llvm.amdgcn.mfma.f32.16x16x4f32(
 
 ; MODREP-specific: NO kernel-entry init_whole_wave (that's the
 ; WaveNative sibling's signature).
-; CHECK-NOT: call {{.*}} @llvm.amdgcn.init.whole.wave
+; MODREP-NOT: call {{.*}} @llvm.amdgcn.init.whole.wave
 
 ; Negative: no native gfx1250 WMMA intrinsic (gfx942 target).
-; CHECK-NOT: @llvm.amdgcn.wmma.f32.16x16x4.f32
+; MODREP-NOT: @llvm.amdgcn.wmma.f32.16x16x4.f32
 
 ; Negative: no cross-K MFMA intrinsics.
-; CHECK-NOT: @llvm.amdgcn.mfma.f32.16x16x16f16
-; CHECK-NOT: @llvm.amdgcn.mfma.f32.16x16x16bf16
-; CHECK-NOT: @llvm.amdgcn.mfma.f32.16x16x32_
+; MODREP-NOT: @llvm.amdgcn.mfma.f32.16x16x16f16
+; MODREP-NOT: @llvm.amdgcn.mfma.f32.16x16x16bf16
+; MODREP-NOT: @llvm.amdgcn.mfma.f32.16x16x32_
 
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
 ; RUN:   && %raise_cli %t.hsaco \
@@ -307,7 +307,7 @@
 ;     (`16x16x32` or `16x16x64`) — would indicate cross-K
 ;     dispatch confusion.
 
-; CHECK-LABEL: define amdgpu_kernel void @wmma_f32_16x16x4_f32_kernel(
+; IR-LABEL: define amdgpu_kernel void @wmma_f32_16x16x4_f32_kernel(
 
 ; The native gfx1250 WMMA intrinsic, with the K=4 f32 fragment
 ; shape reflected in the mangled types `.v8f32.v2f32`. Modifier

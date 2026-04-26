@@ -1,5 +1,3 @@
-; XFAIL: *
-;
 ; RUN: %llvm_mc -mcpu=gfx950 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
 ; RUN:   && %raise_cli %t.hsaco --target-isa=gfx942 --emit-ir=s_atomic_dec_kernel 2>/dev/null | %FileCheck %s
 ;

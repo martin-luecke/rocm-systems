@@ -156,7 +156,7 @@
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
 ; RUN:   && %raise_cli %t.hsaco \
 ; RUN:     --target-isa=gfx1250 --emit-ir=global_load_async_to_lds_kernel 2>&1 \
-; RUN:   | %FileCheck %s --check-prefix=IR
+; RUN:   | %FileCheck %s --check-prefix=SAME
 ;
 ; Lift fixture for FLAT `global_load_async_to_lds_b{8,32,64,128}` —
 ; the same-target (gfx1250 → gfx1250) intrinsic-emit path. Pins
@@ -214,36 +214,36 @@
 
 ; b32: per-lane LDS i32 base via inttoptr i32 → ptr addrspace(3),
 ; then the b32 async DMA call.
-; IR: %lds_ptr{{[0-9]*}} = inttoptr i32 {{.*}} to ptr addrspace(3)
-; IR: call void @llvm.amdgcn.global.load.async.to.lds.b32(
-; IR-SAME: ptr addrspace(1)
-; IR-SAME: ptr addrspace(3) %lds_ptr
-; IR-SAME: i32 0
-; IR-SAME: i32 {{-?[0-9]+}}
+; SAME: %lds_ptr{{[0-9]*}} = inttoptr i32 {{.*}} to ptr addrspace(3)
+; SAME: call void @llvm.amdgcn.global.load.async.to.lds.b32(
+; SAME-SAME: ptr addrspace(1)
+; SAME-SAME: ptr addrspace(3) %lds_ptr
+; SAME-SAME: i32 0
+; SAME-SAME: i32 {{-?[0-9]+}}
 
 ; b64: same shape, b64 intrinsic.
-; IR: %lds_ptr{{[0-9]*}} = inttoptr i32 {{.*}} to ptr addrspace(3)
-; IR: call void @llvm.amdgcn.global.load.async.to.lds.b64(
-; IR-SAME: ptr addrspace(1)
-; IR-SAME: ptr addrspace(3) %lds_ptr
-; IR-SAME: i32 0
-; IR-SAME: i32 {{-?[0-9]+}}
+; SAME: %lds_ptr{{[0-9]*}} = inttoptr i32 {{.*}} to ptr addrspace(3)
+; SAME: call void @llvm.amdgcn.global.load.async.to.lds.b64(
+; SAME-SAME: ptr addrspace(1)
+; SAME-SAME: ptr addrspace(3) %lds_ptr
+; SAME-SAME: i32 0
+; SAME-SAME: i32 {{-?[0-9]+}}
 
 ; b128: same shape, b128 intrinsic.
-; IR: %lds_ptr{{[0-9]*}} = inttoptr i32 {{.*}} to ptr addrspace(3)
-; IR: call void @llvm.amdgcn.global.load.async.to.lds.b128(
-; IR-SAME: ptr addrspace(1)
-; IR-SAME: ptr addrspace(3) %lds_ptr
-; IR-SAME: i32 0
-; IR-SAME: i32 {{-?[0-9]+}}
+; SAME: %lds_ptr{{[0-9]*}} = inttoptr i32 {{.*}} to ptr addrspace(3)
+; SAME: call void @llvm.amdgcn.global.load.async.to.lds.b128(
+; SAME-SAME: ptr addrspace(1)
+; SAME-SAME: ptr addrspace(3) %lds_ptr
+; SAME-SAME: i32 0
+; SAME-SAME: i32 {{-?[0-9]+}}
 
 ; b8: same shape, b8 intrinsic.
-; IR: %lds_ptr{{[0-9]*}} = inttoptr i32 {{.*}} to ptr addrspace(3)
-; IR: call void @llvm.amdgcn.global.load.async.to.lds.b8(
-; IR-SAME: ptr addrspace(1)
-; IR-SAME: ptr addrspace(3) %lds_ptr
-; IR-SAME: i32 0
-; IR-SAME: i32 {{-?[0-9]+}}
+; SAME: %lds_ptr{{[0-9]*}} = inttoptr i32 {{.*}} to ptr addrspace(3)
+; SAME: call void @llvm.amdgcn.global.load.async.to.lds.b8(
+; SAME-SAME: ptr addrspace(1)
+; SAME-SAME: ptr addrspace(3) %lds_ptr
+; SAME-SAME: i32 0
+; SAME-SAME: i32 {{-?[0-9]+}}
 
 	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
 	.amdhsa_code_object_version 6

@@ -235,6 +235,107 @@ v_cvt_scale_pk8_bf16_fp4_kernel:        ; @v_cvt_scale_pk8_bf16_fp4_kernel
 		.amdhsa_exception_int_div_zero 0
 	.end_amdhsa_kernel
 	.text
+.Lfunc_end0:
+	.size	v_cvt_scale_pk8_bf16_fp4_kernel, .Lfunc_end0-v_cvt_scale_pk8_bf16_fp4_kernel
+                                        ; -- End function
+	.set v_cvt_scale_pk8_bf16_fp4_kernel.num_vgpr, 5
+	.set v_cvt_scale_pk8_bf16_fp4_kernel.num_agpr, 0
+	.set v_cvt_scale_pk8_bf16_fp4_kernel.numbered_sgpr, 3
+	.set v_cvt_scale_pk8_bf16_fp4_kernel.num_named_barrier, 0
+	.set v_cvt_scale_pk8_bf16_fp4_kernel.private_seg_size, 0
+	.set v_cvt_scale_pk8_bf16_fp4_kernel.uses_vcc, 0
+	.set v_cvt_scale_pk8_bf16_fp4_kernel.uses_flat_scratch, 0
+	.set v_cvt_scale_pk8_bf16_fp4_kernel.has_dyn_sized_stack, 0
+	.set v_cvt_scale_pk8_bf16_fp4_kernel.has_recursion, 0
+	.set v_cvt_scale_pk8_bf16_fp4_kernel.has_indirect_call, 0
+	.section	.AMDGPU.csdata,"",@progbits
+; Kernel info:
+; codeLenInByte = 92
+; TotalNumSgprs: 3
+; NumVgprs: 5
+; ScratchSize: 0
+; MemoryBound: 0
+; FloatMode: 240
+; IeeeMode: 1
+; LDSByteSize: 0 bytes/workgroup (compile time only)
+; SGPRBlocks: 0
+; VGPRBlocks: 0
+; NumSGPRsForWavesPerEU: 3
+; NumVGPRsForWavesPerEU: 5
+; NamedBarCnt: 0
+; Occupancy: 16
+; WaveLimiterHint : 0
+; COMPUTE_PGM_RSRC2:SCRATCH_EN: 0
+; COMPUTE_PGM_RSRC2:USER_SGPR: 2
+; COMPUTE_PGM_RSRC2:TRAP_HANDLER: 0
+; COMPUTE_PGM_RSRC2:TGID_X_EN: 1
+; COMPUTE_PGM_RSRC2:TGID_Y_EN: 0
+; COMPUTE_PGM_RSRC2:TGID_Z_EN: 0
+; COMPUTE_PGM_RSRC2:TIDIG_COMP_CNT: 0
+	.text
+	.globl	v_cvt_scale_pk8_bf16_fp4_kernel_sel2
+	.p2align	8
+	.type	v_cvt_scale_pk8_bf16_fp4_kernel_sel2,@function
+v_cvt_scale_pk8_bf16_fp4_kernel_sel2:   ; @v_cvt_scale_pk8_bf16_fp4_kernel_sel2
+; %bb.0:
+	s_load_b64 s[0:1], s[0:1], 0x0
+	s_wait_kmcnt 0x0
+	v_dual_mov_b32 v4, 0 :: v_dual_mov_b32 v0, s0
+	s_add_co_i32 s2, s0, 4
+	s_delay_alu instid0(VALU_DEP_1) | instid1(SALU_CYCLE_1)
+	v_cvt_scale_pk8_bf16_fp4 v[0:3], v0, s2 scale_sel:2
+	s_delay_alu instid0(VALU_DEP_1) | instskip(NEXT) | instid1(VALU_DEP_1)
+	v_and_b32_e32 v1, 0xffff, v0
+	v_lshl_or_b32 v0, v0, 16, v1
+	s_delay_alu instid0(VALU_DEP_1)
+	v_dual_mov_b32 v1, v0 :: v_dual_mov_b32 v2, v0
+	v_mov_b32_e32 v3, v0
+	global_store_b128 v4, v[0:3], s[0:1]
+	s_endpgm
+	.section	.rodata,"a",@progbits
+	.p2align	6, 0x0
+	.amdhsa_kernel v_cvt_scale_pk8_bf16_fp4_kernel_sel2
+		.amdhsa_group_segment_fixed_size 0
+		.amdhsa_private_segment_fixed_size 0
+		.amdhsa_kernarg_size 8
+		.amdhsa_user_sgpr_count 2
+		.amdhsa_user_sgpr_dispatch_ptr 0
+		.amdhsa_user_sgpr_queue_ptr 0
+		.amdhsa_user_sgpr_kernarg_segment_ptr 1
+		.amdhsa_user_sgpr_dispatch_id 0
+		.amdhsa_user_sgpr_kernarg_preload_length 0
+		.amdhsa_user_sgpr_kernarg_preload_offset 0
+		.amdhsa_user_sgpr_private_segment_size 0
+		.amdhsa_wavefront_size32 1
+		.amdhsa_uses_dynamic_stack 0
+		.amdhsa_enable_private_segment 0
+		.amdhsa_system_sgpr_workgroup_id_x 1
+		.amdhsa_system_sgpr_workgroup_id_y 0
+		.amdhsa_system_sgpr_workgroup_id_z 0
+		.amdhsa_system_sgpr_workgroup_info 0
+		.amdhsa_system_vgpr_workitem_id 0
+		.amdhsa_next_free_vgpr 5
+		.amdhsa_next_free_sgpr 3
+		.amdhsa_named_barrier_count 0
+		.amdhsa_reserve_vcc 0
+		.amdhsa_float_round_mode_32 0
+		.amdhsa_float_round_mode_16_64 0
+		.amdhsa_float_denorm_mode_32 3
+		.amdhsa_float_denorm_mode_16_64 3
+		.amdhsa_fp16_overflow 0
+		.amdhsa_memory_ordered 1
+		.amdhsa_forward_progress 1
+		.amdhsa_inst_pref_size 1
+		.amdhsa_round_robin_scheduling 0
+		.amdhsa_exception_fp_ieee_invalid_op 0
+		.amdhsa_exception_fp_denorm_src 0
+		.amdhsa_exception_fp_ieee_div_zero 0
+		.amdhsa_exception_fp_ieee_overflow 0
+		.amdhsa_exception_fp_ieee_underflow 0
+		.amdhsa_exception_fp_ieee_inexact 0
+		.amdhsa_exception_int_div_zero 0
+	.end_amdhsa_kernel
+	.text
 	.p2alignl 7, 3214868480
 	.fill 96, 4, 3214868480
 	.text
