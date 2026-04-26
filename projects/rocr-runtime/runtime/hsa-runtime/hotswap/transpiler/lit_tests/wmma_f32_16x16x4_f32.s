@@ -1,5 +1,8 @@
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
-; RUN:   && %raise_cli %t.hsaco --target-isa=gfx942 --enable-wave-native --emit-ir=wmma_f32_16x16x4_f32_kernel 2>/dev/null | %FileCheck %s
+; RUN:   && %raise_cli %t.hsaco \
+; RUN:     --target-isa=gfx942 --enable-wave-native \
+; RUN:     --emit-ir=wmma_f32_16x16x4_f32_kernel 2>/dev/null \
+; RUN:   | %FileCheck %s
 ;
 ; Cross-target lift fixture for v_wmma_f32_16x16x4_f32 (gfx1250 RDNA4
 ; VOP3P opcode 0x05D) lowered to gfx942 (CDNA3) via
@@ -142,14 +145,101 @@
 ; CHECK-NOT: @llvm.amdgcn.mfma.f32.16x16x32_
 
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
-; RUN:   && %raise_cli %t.hsaco --target-isa=gfx1250 --emit-ir=wmma_f32_16x16x4_f32_kernel 2>&1 | %FileCheck %s --check-prefix=IR
+; RUN:   && %raise_cli %t.hsaco \
+; RUN:     --target-isa=gfx942 --disable-wave-native \
+; RUN:     --emit-ir=wmma_f32_16x16x4_f32_kernel 2>/dev/null \
+; RUN:   | %FileCheck %s
 ;
-; Note: this block's `CHECK-LABEL` below is intentionally spelled
-; `IR-LABEL` — consolidating the old `.ll` + `_same_target.ll` pair
-; into a single `.s` means the default-prefix FileCheck run (the
-; first RUN above) would otherwise see two `CHECK-LABEL`s and demand
-; two matching kernel defs in the cross-target output, which only
-; has one.
+; K=4 WMMA cross-target lift — MODULOREPLICATION regression pin.
+; Runs the same `.co` as `wmma_f32_16x16x4_f32.ll` but with
+; `--disable-wave-native` so `ModuloReplicationProjection`
+; engages instead of `WaveNativeProjection`.
+;
+; Why this sibling exists
+; =======================
+;
+; Pre-Session-8 (2026-04-23) `handle_valu_vop3p.cpp`'s K=4 arm
+; refused the MODREP lift with `RaiseFailure::unsupportedShape`
+; whenever `kernelHasPermlane16Swap` was true — a conservative
+; sidecar refusal added during the matmul_fp16 multi-WMMA
+; investigation.  The root cause turned out to be one layer up
+; (the symmetric `v_permlane16_swap_b32` lift; see
+; `handle_valu_cross_lane.cpp::emitPermLaneSwapEmulation` and
+; matrix-translation.md §12.4.7), so the refusal was dropped and
+; the K=4 MFMA redistribution runs in both projections.  No
+; corpus kernel today exercises K=4 under MODREP — the gap
+; between "K=4 MODREP drops through" and "K=4 MODREP is tested"
+; is what this fixture closes.
+;
+; Invariants pinned (deliberately a subset of the WaveNative
+; sibling's contract — the projection-specific fixture asserts
+; the shared `emitWMMAtoMFMA_F32_16x16x4` structure, not the
+; projection-specific EXEC-virtualisation story):
+;
+;   1. The lift SUCCEEDS (pre-Session-8 it refused loudly; a
+;      regression to the refusal gate would fail the CHECK-LABEL
+;      because the kernel wouldn't be emitted).
+;
+;   2. Exactly ONE `mfma.f32.16x16x4f32` call.  Under MODREP
+;      `numSourceWavesPerTarget() == 1` (phantom-lane regime
+;      single-source-wave projection), so
+;      `emitWMMAtoMFMA_F32_16x16x4` emits ONE group pass — the
+;      WaveNative sibling's two-pass layout is projection-
+;      specific and must NOT surface under MODREP.
+;
+;   3. The MFMA signature is `(float, float, <4 x float>)` — NOT
+;      the K=16 / K=32 packed shapes.  A dispatch misroute into
+;      the K=32/K=64 WMMA arm would surface as a differently-
+;      typed MFMA call.
+;
+;   4. MODREP-specific: NO `@llvm.amdgcn.init.whole.wave` call.
+;      `WaveNativeProjection::emitInitialExec` emits exactly one
+;      at kernel entry to make HW EXEC=-1 a kernel-wide ambient;
+;      `ModuloReplicationProjection` does NOT (HW EXEC remains
+;      the source-active mask).  Per-MFMA `strict.wwm` brackets
+;      (emitted by `wrapAsWWMValue` under MODREP) are the
+;      wave-scoped EXEC=-1 mechanism this projection uses.
+;
+;   5. At least one `@llvm.amdgcn.strict.wwm.*` call — the
+;      MODREP-specific WWM bracket around the lane
+;      redistribution / MFMA / collect chain that substitutes for
+;      the WaveNative init_whole_wave ambient.  A regression that
+;      loses both would ship a silently miscompiled kernel
+;      (the MFMA would execute under the source-active EXEC
+;      mask, leaving the phantom lanes' MFMA inputs undef).
+
+; CHECK-LABEL: define amdgpu_kernel void @wmma_f32_16x16x4_f32_kernel(
+
+; Exactly one MFMA call — MODREP is single-source-wave.
+; CHECK: call <4 x float> @llvm.amdgcn.mfma.f32.16x16x4f32(float %{{[^,]+}}, float %{{[^,]+}}, <4 x float> %{{[^,]+}}, i32 0, i32 0, i32 0)
+
+; MODREP-specific strict.wwm wrap around the MFMA result.  The
+; projection-specific WWM bracket (`wrapAsWWMValue`) substitutes
+; for the WaveNative init_whole_wave kernel-entry ambient.  A
+; regression that loses both would ship a silently miscompiled
+; kernel (the MFMA would execute under the source-active EXEC
+; mask, leaving the phantom lanes' MFMA inputs undef).
+; CHECK: call {{.*}} @llvm.amdgcn.strict.wwm
+
+; Exactly one MFMA call (anchored AFTER the positive check).
+; CHECK-NOT: call <4 x float> @llvm.amdgcn.mfma.f32.16x16x4f32(
+
+; MODREP-specific: NO kernel-entry init_whole_wave (that's the
+; WaveNative sibling's signature).
+; CHECK-NOT: call {{.*}} @llvm.amdgcn.init.whole.wave
+
+; Negative: no native gfx1250 WMMA intrinsic (gfx942 target).
+; CHECK-NOT: @llvm.amdgcn.wmma.f32.16x16x4.f32
+
+; Negative: no cross-K MFMA intrinsics.
+; CHECK-NOT: @llvm.amdgcn.mfma.f32.16x16x16f16
+; CHECK-NOT: @llvm.amdgcn.mfma.f32.16x16x16bf16
+; CHECK-NOT: @llvm.amdgcn.mfma.f32.16x16x32_
+
+; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
+; RUN:   && %raise_cli %t.hsaco \
+; RUN:     --target-isa=gfx1250 --emit-ir=wmma_f32_16x16x4_f32_kernel 2>&1 \
+; RUN:   | %FileCheck %s --check-prefix=IR
 ;
 ; Lift fixture for v_wmma_f32_16x16x4_f32 (gfx1250 RDNA4 VOP3P
 ; opcode 0x05D) — same-target (gfx1250 -> gfx1250) intrinsic-emit
@@ -217,7 +307,7 @@
 ;     (`16x16x32` or `16x16x64`) — would indicate cross-K
 ;     dispatch confusion.
 
-; IR-LABEL: define amdgpu_kernel void @wmma_f32_16x16x4_f32_kernel(
+; CHECK-LABEL: define amdgpu_kernel void @wmma_f32_16x16x4_f32_kernel(
 
 ; The native gfx1250 WMMA intrinsic, with the K=4 f32 fragment
 ; shape reflected in the mangled types `.v8f32.v2f32`. Modifier
@@ -235,15 +325,14 @@
 ; IR-NOT: @llvm.amdgcn.wmma.f32.16x16x64.
 ; IR-NOT: @llvm.amdgcn.wmma.i32.16x16x64.
 
-
 	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
 	.amdhsa_code_object_version 6
 	.text
 	.globl	wmma_f32_16x16x4_f32_kernel
 	.p2align	8
 	.type	wmma_f32_16x16x4_f32_kernel,@function
-wmma_f32_16x16x4_f32_kernel:
-	s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1
+wmma_f32_16x16x4_f32_kernel:            ; @wmma_f32_16x16x4_f32_kernel
+; %bb.0:
 	s_clause 0x1
 	s_load_b128 s[8:11], s[0:1], 0x0
 	s_load_b64 s[12:13], s[0:1], 0x10
@@ -268,14 +357,45 @@ wmma_f32_16x16x4_f32_kernel:
 	.section	.rodata,"a",@progbits
 	.p2align	6, 0x0
 	.amdhsa_kernel wmma_f32_16x16x4_f32_kernel
+		.amdhsa_group_segment_fixed_size 0
+		.amdhsa_private_segment_fixed_size 0
 		.amdhsa_kernarg_size 24
 		.amdhsa_user_sgpr_count 2
+		.amdhsa_user_sgpr_dispatch_ptr 0
+		.amdhsa_user_sgpr_queue_ptr 0
 		.amdhsa_user_sgpr_kernarg_segment_ptr 1
+		.amdhsa_user_sgpr_dispatch_id 0
+		.amdhsa_user_sgpr_kernarg_preload_length 0
+		.amdhsa_user_sgpr_kernarg_preload_offset 0
+		.amdhsa_user_sgpr_private_segment_size 0
 		.amdhsa_wavefront_size32 1
+		.amdhsa_uses_dynamic_stack 0
+		.amdhsa_enable_private_segment 0
+		.amdhsa_system_sgpr_workgroup_id_x 1
+		.amdhsa_system_sgpr_workgroup_id_y 0
+		.amdhsa_system_sgpr_workgroup_id_z 0
+		.amdhsa_system_sgpr_workgroup_info 0
+		.amdhsa_system_vgpr_workitem_id 0
 		.amdhsa_next_free_vgpr 12
 		.amdhsa_next_free_sgpr 18
+		.amdhsa_named_barrier_count 0
+		.amdhsa_reserve_vcc 0
+		.amdhsa_float_round_mode_32 0
+		.amdhsa_float_round_mode_16_64 0
 		.amdhsa_float_denorm_mode_32 3
-		.amdhsa_inst_pref_size 2
+		.amdhsa_float_denorm_mode_16_64 3
+		.amdhsa_fp16_overflow 0
+		.amdhsa_memory_ordered 1
+		.amdhsa_forward_progress 1
+		.amdhsa_inst_pref_size 1
+		.amdhsa_round_robin_scheduling 0
+		.amdhsa_exception_fp_ieee_invalid_op 0
+		.amdhsa_exception_fp_denorm_src 0
+		.amdhsa_exception_fp_ieee_div_zero 0
+		.amdhsa_exception_fp_ieee_overflow 0
+		.amdhsa_exception_fp_ieee_underflow 0
+		.amdhsa_exception_fp_ieee_inexact 0
+		.amdhsa_exception_int_div_zero 0
 	.end_amdhsa_kernel
 	.text
 	.p2alignl 7, 3214868480
@@ -285,20 +405,40 @@ wmma_f32_16x16x4_f32_kernel:
 ---
 amdhsa.kernels:
   - .args:
-      - { .address_space:  global, .offset:         0, .size:           8, .value_kind:     global_buffer }
-      - { .address_space:  global, .offset:         8, .size:           8, .value_kind:     global_buffer }
-      - { .address_space:  global, .offset:         16, .size:           8, .value_kind:     global_buffer }
+      - .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
     .group_segment_fixed_size: 0
     .kernarg_segment_align: 8
     .kernarg_segment_size: 24
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
     .max_flat_workgroup_size: 1024
     .name:           wmma_f32_16x16x4_f32_kernel
     .private_segment_fixed_size: 0
     .sgpr_count:     18
+    .sgpr_spill_count: 0
     .symbol:         wmma_f32_16x16x4_f32_kernel.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
     .vgpr_count:     12
+    .vgpr_spill_count: 0
     .wavefront_size: 32
-amdhsa.version: [1, 2]
+amdhsa.target:   amdgcn-amd-amdhsa--gfx1250
+amdhsa.version:
+  - 1
+  - 2
 ...
 
 	.end_amdgpu_metadata

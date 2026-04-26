@@ -1,11 +1,31 @@
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
-; RUN:   && %raise_cli %t.hsaco --emit-ir=v_cvt_scale_pk8_bf16_fp4_kernel 2>/dev/null | %FileCheck %s
+; RUN:   && %raise_cli %t.hsaco \
+; RUN:     --emit-ir=v_cvt_scale_pk8_bf16_fp4_kernel 2>/dev/null \
+; RUN:   | %FileCheck %s
 ;
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
-; RUN:   && %not %raise_cli %t.hsaco --target-isa=gfx942 --emit-ir=v_cvt_scale_pk8_bf16_fp4_kernel 2>&1 | %FileCheck --check-prefix=CROSS %s
+; RUN:   && %raise_cli %t.hsaco \
+; RUN:     --target-isa=gfx942 \
+; RUN:     --emit-ir=v_cvt_scale_pk8_bf16_fp4_kernel 2>/dev/null \
+; RUN:   | %FileCheck --check-prefix=CROSS %s
+;
+; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
+; RUN:   && %not %raise_cli %t.hsaco \
+; RUN:     --emit-ir=v_cvt_scale_pk8_bf16_fp4_kernel_sel2 2>&1 \
+; RUN:   | %FileCheck --check-prefix=REFUSE-SAME %s
+;
+; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
+; RUN:   && %not %raise_cli %t.hsaco \
+; RUN:     --target-isa=gfx942 \
+; RUN:     --emit-ir=v_cvt_scale_pk8_bf16_fp4_kernel_sel2 2>&1 \
+; RUN:   | %FileCheck --check-prefix=REFUSE-CROSS %s
 ;
 ; Pins the gfx1250-only VOP3 packed-8 FP4 -> BF16 scaled convert
-; (V_CVT_SCALE_PK8_BF16_FP4_e64, VOP3Instructions.td:1788).
+; (V_CVT_SCALE_PK8_BF16_FP4_e64, VOP3Instructions.td:1873).  See
+; `hotswap/docs/matrix-translation.md §7.4` for the design note on
+; the cross-target dequant expansion and the declared support set
+; (scale_sel == 0 only; the two captured corpus blobs use only that
+; value across 128 instances combined).
 ;
 ; Same-target lift (RUN #1): the handler emits the LLVM intrinsic
 ; `@llvm.amdgcn.cvt.scale.pk8.bf16.fp4(i32, i32, i32 immarg)` with
@@ -14,11 +34,13 @@
 ; to i128 / four dwords before handing it to `writeRegVec`.  No
 ; cross-target refusal fires on the same-target path.
 ;
-; Cross-target lift (RUN #2): the handler refuses loudly because
-; `int_amdgcn_cvt_scale_pk8_bf16_fp4` is gated behind `isGFX125xOnly`
-; in IntrinsicsAMDGPU.td:686 and gfx942 has no MX-FP4 scaling unit.
-; The refusal message pins the ISA / intrinsic / isGFX125xOnly
-; anchor so a future TableGen rename forces a visible test update.
+; Cross-target lift (RUN #2): the handler emits the per-nibble
+; dequantisation expansion from
+; `handle_valu.cpp::emitCvtScalePk8Bf16Fp4CrossTargetExpansion` —
+; bit-algebra FP4 -> BF16 + E8M0 exponent-bits add + priority-
+; ordered NaN / ±0 / overflow / subnormal merge, producing an
+; <8 x bfloat> that writeRegVec consumes identically to the
+; same-target path.
 
 ; CHECK-LABEL: define amdgpu_kernel void @v_cvt_scale_pk8_bf16_fp4_kernel(
 
@@ -35,16 +57,117 @@
 ; annotation (`range(i32 0, 16)`) and the exact bf16-fp4 name.
 ; CHECK-DAG: declare <8 x bfloat> @llvm.amdgcn.cvt.scale.pk8.bf16.fp4(i32, i32, i32 immarg range(i32 0, 16))
 
-; Negative pins: no cross-target refusal on the same-target path,
-; and no accidental fallback through the unscaled `cvt_pk_f32_fp8`
-; / `cvt_f32_fp8` paths that share similar mnemonics.
-; CHECK-NOT: cross-target lift to gfx942
+; Negative pins on the same-target path: no cross-target refusal, and
+; no accidental fallback through the unscaled `cvt_pk_f32_fp8` /
+; `cvt_f32_fp8` paths that share similar mnemonics.  Also pin that
+; we did NOT accidentally emit the cross-target bit-algebra
+; expansion instead of the intrinsic on the same-target path — the
+; expansion would route through `mxfp4_nibble` named temporaries.
+; CHECK-NOT: scale_sel != 0
 ; CHECK-NOT: amdgcn.cvt.pk.f32
 ; CHECK-NOT: amdgcn.cvt.f32.fp8
+; CHECK-NOT: mxfp4_nibble
 
-; CROSS: v_cvt_scale_pk8_bf16_fp4 is a gfx1250-only VOP3
-; CROSS-SAME: isGFX125xOnly
-; CROSS-SAME: no corpus kernel exercises today
+; ── Cross-target expansion ──────────────────────────────────────────
+;
+; On gfx942 (no FeatureGFX1250Insts, no MX-FP4 scaling unit), the
+; handler emits the per-nibble bit-algebra dequant.  The intrinsic
+; MUST NOT appear anywhere in the IR — routing the cross-target arm
+; through the gfx1250-only intrinsic would lower to an
+; "UnsupportedOpcode" backend failure on gfx942.
+; CROSS-LABEL: define amdgpu_kernel void @v_cvt_scale_pk8_bf16_fp4_kernel(
+; CROSS-NOT: call <8 x bfloat> @llvm.amdgcn.cvt.scale.pk8.bf16.fp4
+
+; The handler's named temporaries (from
+; `handle_valu.cpp::emitCvtScalePk8Bf16Fp4CrossTargetExpansion`)
+; uniquify in the final IR as `%mxfp4_<name>`, `%mxfp4_<name>5`,
+; `%mxfp4_<name>12`, ... (one suffix bucket per lane).  We pin the
+; first-lane form (no suffix) for each checkpoint — that implicitly
+; verifies emission ORDER (`mxfp4_nibble` before `mxfp4_scale_byte`
+; etc. was wrong, so the checkpoints are order-insensitive via
+; CROSS-DAG where semantically commutative).
+;
+; E8M0 scale-byte extraction: low byte of the scale i32 (scale_sel ==
+; 0 only).  Emitted ONCE (before the per-lane loop) so not suffixed.
+; CROSS: %mxfp4_scale_byte = and i32 %{{.*}}, 255
+; CROSS: %mxfp4_is_scale_nan = icmp eq i32 %mxfp4_scale_byte, 255
+
+; Per-lane nibble extraction: `lshr` by lane*4 then mask 0xF.  Pin
+; the first-lane form.
+; CROSS-DAG: %mxfp4_nibble = and i32 %{{.*}}, 15
+
+; Per-lane FP4 E2M1 field decomposition: sign (bit 3), exp (bits 2..1),
+; mant (bit 0).
+; CROSS-DAG: %mxfp4_sign = and i32 %{{.*}}, 1
+; CROSS-DAG: %mxfp4_exp_fp4 = and i32 %{{.*}}, 3
+; CROSS-DAG: %mxfp4_mant_fp4 = and i32 %mxfp4_nibble, 1
+
+; FP4 -> BF16 field synthesis: normal-branch exp is exp_fp4 + 126.
+; CROSS-DAG: %mxfp4_bf16_exp_norm = add i32 %mxfp4_exp_fp4, 126
+
+; Subnormal-FP4 branch selector: exp_fp4 == 0.
+; CROSS-DAG: %mxfp4_is_fp4_sub = icmp eq i32 %mxfp4_exp_fp4, 0
+
+; Scaled exponent: bf16_exp + scale_byte - 127.
+; CROSS-DAG: %mxfp4_exp_plus_scale = add i32 %mxfp4_bf16_exp, %mxfp4_scale_byte
+; CROSS-DAG: %mxfp4_new_exp = sub i32 %mxfp4_exp_plus_scale, 127
+
+; Overflow saturate to ±Inf: (sign << 15) | 0x7F80 (= 32640 decimal).
+; CROSS-DAG: %mxfp4_is_overflow = icmp sge i32 %mxfp4_new_exp, 255
+; CROSS-DAG: %mxfp4_inf_bits = or i32 %mxfp4_sign_field, 32640
+
+; Subnormal shift: (0x80 | bf16_mant) right-shifted by (1 - new_exp),
+; clamped to zero at shift >= 8.
+; CROSS-DAG: %mxfp4_implicit_1_mant = or i32 128, %mxfp4_bf16_mant
+; CROSS-DAG: %mxfp4_shift_amt = sub i32 1, %mxfp4_new_exp
+; CROSS-DAG: %mxfp4_shift_too_big = icmp sge i32 %mxfp4_shift_amt, 8
+
+; Per-lane priority merge lands as a nested select into a bfloat, then
+; inserted into the <8 x bfloat> accumulator.
+; CROSS-DAG: %mxfp4_lane_i16 = trunc i32 %mxfp4_lane_i32 to i16
+; CROSS-DAG: %mxfp4_lane_bf16 = bitcast i16 %mxfp4_lane_i16 to bfloat
+; CROSS: insertelement <8 x bfloat>
+
+; The <8 x bfloat> result flows into the same writeRegVec -> i128
+; split the same-target arm produces.  Pin the bitcast so any drift
+; in writeRegVec's shape surfaces immediately.
+; CROSS: bitcast <8 x bfloat> %{{.*}} to i128
+
+; The LUT table's 16-entry constants aren't emitted by the bit-
+; algebra form (no `constant` or `private global` [16 x i16] shows
+; up); the expansion stays register-only.  Negative pin so a
+; future LUT-based refactor surfaces as a visible diff.
+; CROSS-NOT: private constant [16 x i16]
+
+; Refusal-message sanity pin: the previous release's refusal-block
+; diagnostic ("is a gfx1250-only VOP3" / "no corpus kernel exercises
+; today") was replaced by the expansion.  If either ever reappears
+; on the cross-target path, the refusal path has regressed.
+; CROSS-NOT: v_cvt_scale_pk8_bf16_fp4 is a gfx1250-only VOP3
+; CROSS-NOT: no corpus kernel exercises today
+
+; ── scale_sel != 0 refusal, both arms ──────────────────────────────
+;
+; Pins the handler's "declared support set" boundary: the 4-bit
+; `scale_sel` field's semantics for packed-8 FP4 aren't pinned
+; in-tree (no AMD ISA spec in the tree; captured corpus uses only
+; scale_sel == 0).  Widening the support set requires either the
+; spec landing OR a corpus kernel + canary exercising the case.
+; Until then, both handler arms refuse loudly with a diagnostic
+; citing §7.4.
+;
+; Same-target arm refuses pre-intrinsic (no ` @llvm.amdgcn.cvt.scale.pk8.bf16.fp4`
+; call should appear in the diagnostic-emitting output).
+; REFUSE-SAME: scale_sel != 0 is outside the declared support set
+; REFUSE-SAME-SAME: matrix-translation.md §7.4
+; REFUSE-SAME-NOT: call <8 x bfloat> @llvm.amdgcn.cvt.scale.pk8.bf16.fp4
+
+; Cross-target arm refuses pre-expansion (no `mxfp4_` named
+; temporaries should appear in the diagnostic-emitting output).
+; REFUSE-CROSS: scale_sel != 0 is outside the declared support set
+; REFUSE-CROSS-SAME: matrix-translation.md §7.4
+; REFUSE-CROSS-NOT: mxfp4_nibble
+; REFUSE-CROSS-NOT: call <8 x bfloat> @llvm.amdgcn.cvt.scale.pk8.bf16.fp4
 
 	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
 	.amdhsa_code_object_version 6
@@ -52,8 +175,8 @@
 	.globl	v_cvt_scale_pk8_bf16_fp4_kernel
 	.p2align	8
 	.type	v_cvt_scale_pk8_bf16_fp4_kernel,@function
-v_cvt_scale_pk8_bf16_fp4_kernel:
-	s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1
+v_cvt_scale_pk8_bf16_fp4_kernel:        ; @v_cvt_scale_pk8_bf16_fp4_kernel
+; %bb.0:
 	s_load_b64 s[0:1], s[0:1], 0x0
 	s_wait_kmcnt 0x0
 	v_dual_mov_b32 v4, 0 :: v_dual_mov_b32 v0, s0
@@ -71,14 +194,45 @@ v_cvt_scale_pk8_bf16_fp4_kernel:
 	.section	.rodata,"a",@progbits
 	.p2align	6, 0x0
 	.amdhsa_kernel v_cvt_scale_pk8_bf16_fp4_kernel
+		.amdhsa_group_segment_fixed_size 0
+		.amdhsa_private_segment_fixed_size 0
 		.amdhsa_kernarg_size 8
 		.amdhsa_user_sgpr_count 2
+		.amdhsa_user_sgpr_dispatch_ptr 0
+		.amdhsa_user_sgpr_queue_ptr 0
 		.amdhsa_user_sgpr_kernarg_segment_ptr 1
+		.amdhsa_user_sgpr_dispatch_id 0
+		.amdhsa_user_sgpr_kernarg_preload_length 0
+		.amdhsa_user_sgpr_kernarg_preload_offset 0
+		.amdhsa_user_sgpr_private_segment_size 0
 		.amdhsa_wavefront_size32 1
+		.amdhsa_uses_dynamic_stack 0
+		.amdhsa_enable_private_segment 0
+		.amdhsa_system_sgpr_workgroup_id_x 1
+		.amdhsa_system_sgpr_workgroup_id_y 0
+		.amdhsa_system_sgpr_workgroup_id_z 0
+		.amdhsa_system_sgpr_workgroup_info 0
+		.amdhsa_system_vgpr_workitem_id 0
 		.amdhsa_next_free_vgpr 5
 		.amdhsa_next_free_sgpr 3
+		.amdhsa_named_barrier_count 0
+		.amdhsa_reserve_vcc 0
+		.amdhsa_float_round_mode_32 0
+		.amdhsa_float_round_mode_16_64 0
 		.amdhsa_float_denorm_mode_32 3
+		.amdhsa_float_denorm_mode_16_64 3
+		.amdhsa_fp16_overflow 0
+		.amdhsa_memory_ordered 1
+		.amdhsa_forward_progress 1
 		.amdhsa_inst_pref_size 1
+		.amdhsa_round_robin_scheduling 0
+		.amdhsa_exception_fp_ieee_invalid_op 0
+		.amdhsa_exception_fp_denorm_src 0
+		.amdhsa_exception_fp_ieee_div_zero 0
+		.amdhsa_exception_fp_ieee_overflow 0
+		.amdhsa_exception_fp_ieee_underflow 0
+		.amdhsa_exception_fp_ieee_inexact 0
+		.amdhsa_exception_int_div_zero 0
 	.end_amdhsa_kernel
 	.text
 	.p2alignl 7, 3214868480
@@ -88,18 +242,55 @@ v_cvt_scale_pk8_bf16_fp4_kernel:
 ---
 amdhsa.kernels:
   - .args:
-      - { .address_space:  global, .offset:         0, .size:           8, .value_kind:     global_buffer }
+      - .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
     .group_segment_fixed_size: 0
     .kernarg_segment_align: 8
     .kernarg_segment_size: 8
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
     .max_flat_workgroup_size: 1024
     .name:           v_cvt_scale_pk8_bf16_fp4_kernel
     .private_segment_fixed_size: 0
     .sgpr_count:     3
+    .sgpr_spill_count: 0
     .symbol:         v_cvt_scale_pk8_bf16_fp4_kernel.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
     .vgpr_count:     5
+    .vgpr_spill_count: 0
     .wavefront_size: 32
-amdhsa.version: [1, 2]
+  - .args:
+      - .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 8
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 1024
+    .name:           v_cvt_scale_pk8_bf16_fp4_kernel_sel2
+    .private_segment_fixed_size: 0
+    .sgpr_count:     3
+    .sgpr_spill_count: 0
+    .symbol:         v_cvt_scale_pk8_bf16_fp4_kernel_sel2.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     5
+    .vgpr_spill_count: 0
+    .wavefront_size: 32
+amdhsa.target:   amdgcn-amd-amdhsa--gfx1250
+amdhsa.version:
+  - 1
+  - 2
 ...
 
 	.end_amdgpu_metadata

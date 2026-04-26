@@ -1,65 +1,57 @@
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
 ; RUN:   && %raise_cli %t.hsaco --target-isa=gfx942 \
-; RUN:     --enable-writelane-rewrite \
-; RUN:     --emit-ir=writelane_divergent_rewrite_kernel 2>/dev/null \
-; RUN:   | %FileCheck %s --check-prefix=REWRITE
+; RUN:     --emit-ir=c5_predicate_chain_masked_kernel 2>/dev/null \
+; RUN:   | %FileCheck %s --check-prefix=IR
 ;
-; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
-; RUN:   && %raise_cli %t.hsaco --target-isa=gfx942 \
-; RUN:     --disable-writelane-rewrite \
-; RUN:     --emit-ir=writelane_divergent_rewrite_kernel 2>/dev/null \
-; RUN:   | %FileCheck %s --check-prefix=UNCHANGED
+; Non-refusal sibling for the Class-5 "wave-size-sensitive predicate
+; chain" narrow-O1 classifier
+; (hotswap/docs/modrep-predicate-chain.md §5, transpiler/
+;  c5_predicate_chain_classifier.{hpp,cpp}).
 ;
-; Divergence-triggered `v_writelane_b32` rewrite contract.
+; Paired with `lit_tests/c5_predicate_chain_tid/` which pins the
+; REFUSAL path on the SAME compile-time K=15 predicate. The
+; distinguishing feature of this fixture is an `and %tid, 31` on the
+; chain BEFORE the icmp — the classifier's
+; `isSourceWaveMaskAnd` recognises the mask as collapsing replica-1
+; lanes onto `[0, W_s)` and stops walking, so the icmp-against-K=15
+; never triggers a refusal.
 ;
-; REWRITE path (--enable-writelane-rewrite on):
-;   * `rewriteCrossLaneDivergent` in
-;     `rewrite_cross_lane_divergent.cpp` replaces the
-;     `@llvm.amdgcn.writelane` call with
-;       `select ((lane_id & (W_s-1)) == lane_idx), val_div, old`
-;     preceded by the canonical `mbcnt_lo(-1, 0); mbcnt_hi(-1, prev)`
-;     target-wave lane_id construction in the function's entry block.
-;   * Asserts the four stable signatures:
-;       (a) the `cwd_lane_id_lo` + `cwd_lane_id` two-step mbcnt pair
-;           (rewriter-specific variable names — distinct from the
-;           raiser's `lane_lo` / `lane_id` EXEC-mask-predication pair
-;           around cross-lane primitive sites),
-;       (b) the `cwd_wl_mask` lane-equality predicate,
-;       (c) the `cwd_writelane_rewritten` select,
-;       (d) the absence of any `cwd_readlane_rewritten` sibling
-;           (read half must NOT fire on this fixture).
+; Together, the two fixtures are the principled regression fence for
+; the classifier's soundness-not-completeness contract (see
+; `hotswap/docs/wave-size-translation.md` §7):
+;   - the tid-only fixture (refuses) pins false-positives stay
+;     refused — a future iteration must not sneak an unmasked scan-
+;     stage predicate past the gate;
+;   - the masked fixture (this file, OK) pins the masked case does
+;     not over-refuse — a future iteration must not strip the
+;     `isSourceWaveMaskAnd` recognition and start refusing the SPE
+;     prelude's own `lane_id mod execBits`, the §5.6.2 `wave_id`
+;     lift's mask, or any future `tid AND (W_s - 1)` rewrite that
+;     §5 O2 may eventually land.
 ;
-; UNCHANGED path (flag off -> commit 1 default-off invariant):
-;   * `@llvm.amdgcn.writelane` survives verbatim; the rewrite-emitted
-;     `cwd_*` values are absent (the raiser's own SPE-wrapper lane_id
-;     construction for EXEC-mask predication still appears — that
-;     machinery is ORTHOGONAL to the rewrite pass and predates it, so
-;     we key the negative assertion on the rewriter-specific prefix
-;     `cwd_` rather than on `mbcnt`). Regression guard for commit 1's
-;     "no behaviour change when the flag is off" contract; once
-;     commit 2 flips the classifier to accept rewrite-implemented paths
-;     under the flag, this arm continues to prove the default-off
-;     plumbing works.
+; We assert:
+;   1) Raise succeeds (no `%not`; the RUN line's exit-zero expectation
+;      is enough to fail the test if the classifier regresses into
+;      refusing here).
+;   2) The kernel body is present (IR-LABEL anchors on it).
+;   3) The SOURCE-WAVE MASK `and i32 <...>, 31` appears on the chain
+;      that the classifier used to decide the icmp was safe. This
+;      assertion is stable because the fixture's inline-asm
+;      `v_and_b32_e64 v, t, 31` lifts directly to `and i32 X, 31`;
+;      any future IR-printer change that renames the SSA but
+;      preserves the bitwise shape still matches.
 
-; REWRITE-LABEL: define amdgpu_kernel void @writelane_divergent_rewrite_kernel(
-; REWRITE: %cwd_lane_id_lo = call i32 @llvm.amdgcn.mbcnt.lo
-; REWRITE: %cwd_lane_id = call i32 @llvm.amdgcn.mbcnt.hi
-; REWRITE: %cwd_wl_mask = icmp eq
-; REWRITE: %cwd_writelane_rewritten = select i1
-; REWRITE-NOT: cwd_readlane_rewritten
-
-; UNCHANGED-LABEL: define amdgpu_kernel void @writelane_divergent_rewrite_kernel(
-; UNCHANGED: call i32 @llvm.amdgcn.writelane
-; UNCHANGED-NOT: cwd_lane_id_lo
-; UNCHANGED-NOT: cwd_writelane_rewritten
+; IR-LABEL: define amdgpu_kernel void @c5_predicate_chain_masked_kernel(
+; IR: call i32 @llvm.amdgcn.workitem.id.x()
+; IR: and i32 {{.*}}, 31
 
 	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
 	.amdhsa_code_object_version 6
 	.text
-	.globl	writelane_divergent_rewrite_kernel
+	.globl	c5_predicate_chain_masked_kernel
 	.p2align	8
-	.type	writelane_divergent_rewrite_kernel,@function
-writelane_divergent_rewrite_kernel:     ; @writelane_divergent_rewrite_kernel
+	.type	c5_predicate_chain_masked_kernel,@function
+c5_predicate_chain_masked_kernel:       ; @c5_predicate_chain_masked_kernel
 ; %bb.0:
 	s_clause 0x1
 	s_load_b32 s4, s[0:1], 0x14
@@ -70,27 +62,30 @@ writelane_divergent_rewrite_kernel:     ; @writelane_divergent_rewrite_kernel
 	s_add_co_i32 s0, s0, 1
 	s_getreg_b32 s5, hwreg(HW_REG_IB_STS2, 6, 4)
 	s_mul_i32 s0, ttmp9, s0
-	s_delay_alu instid0(SALU_CYCLE_1) | instskip(SKIP_4) | instid1(SALU_CYCLE_1)
+	;;#ASMSTART
+	v_and_b32_e64 v2, v0, 31
+	
+	;;#ASMEND
 	s_add_co_i32 s1, s1, s0
 	s_wait_kmcnt 0x0
 	s_and_b32 s4, s4, 0xffff
 	s_cmp_eq_u32 s5, 0
 	s_cselect_b32 s0, ttmp9, s1
-	v_mad_u32 v0, s0, s4, v0
+	s_delay_alu instid0(SALU_CYCLE_1)
+	v_mad_u32 v1, s0, s4, v0
 	;;#ASMSTART
-	s_bfe_u32 s0, ttmp8, 0x50019
+	v_cmp_lt_u32_e64 s0, v2, 16
 	
 	;;#ASMEND
 	;;#ASMSTART
-	v_writelane_b32 v1, s0, 0
+	v_cndmask_b32_e64 v0, -1, v0, s0
 	
 	;;#ASMEND
-	v_xor_b32_e32 v1, s0, v1
-	global_store_b32 v0, v1, s[2:3] scale_offset
+	global_store_b32 v1, v0, s[2:3] scale_offset
 	s_endpgm
 	.section	.rodata,"a",@progbits
 	.p2align	6, 0x0
-	.amdhsa_kernel writelane_divergent_rewrite_kernel
+	.amdhsa_kernel c5_predicate_chain_masked_kernel
 		.amdhsa_group_segment_fixed_size 0
 		.amdhsa_private_segment_fixed_size 0
 		.amdhsa_kernarg_size 264
@@ -110,7 +105,7 @@ writelane_divergent_rewrite_kernel:     ; @writelane_divergent_rewrite_kernel
 		.amdhsa_system_sgpr_workgroup_id_z 0
 		.amdhsa_system_sgpr_workgroup_info 0
 		.amdhsa_system_vgpr_workitem_id 0
-		.amdhsa_next_free_vgpr 2
+		.amdhsa_next_free_vgpr 3
 		.amdhsa_next_free_sgpr 6
 		.amdhsa_named_barrier_count 0
 		.amdhsa_reserve_vcc 0
@@ -190,14 +185,14 @@ amdhsa.kernels:
       - 2
       - 0
     .max_flat_workgroup_size: 1024
-    .name:           writelane_divergent_rewrite_kernel
+    .name:           c5_predicate_chain_masked_kernel
     .private_segment_fixed_size: 0
     .sgpr_count:     6
     .sgpr_spill_count: 0
-    .symbol:         writelane_divergent_rewrite_kernel.kd
+    .symbol:         c5_predicate_chain_masked_kernel.kd
     .uniform_work_group_size: 1
     .uses_dynamic_stack: false
-    .vgpr_count:     2
+    .vgpr_count:     3
     .vgpr_spill_count: 0
     .wavefront_size: 32
 amdhsa.target:   amdgcn-amd-amdhsa--gfx1250

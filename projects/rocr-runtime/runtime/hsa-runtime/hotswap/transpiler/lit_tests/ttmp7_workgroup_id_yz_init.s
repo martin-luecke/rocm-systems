@@ -1,65 +1,72 @@
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
 ; RUN:   && %raise_cli %t.hsaco --target-isa=gfx942 \
-; RUN:     --enable-writelane-rewrite \
-; RUN:     --emit-ir=writelane_divergent_rewrite_kernel 2>/dev/null \
-; RUN:   | %FileCheck %s --check-prefix=REWRITE
+; RUN:     --emit-ir=ttmp7_wg_id_y_kernel 2>/dev/null \
+; RUN:   | %FileCheck %s --check-prefix=IR
 ;
-; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
-; RUN:   && %raise_cli %t.hsaco --target-isa=gfx942 \
-; RUN:     --disable-writelane-rewrite \
-; RUN:     --emit-ir=writelane_divergent_rewrite_kernel 2>/dev/null \
-; RUN:   | %FileCheck %s --check-prefix=UNCHANGED
+; Regression-fence for the `ttmp7 = (workgroup_id_z << 16) |
+; (workgroup_id_y & 0xFFFF)` raiser-entry init on gfx12+ (see
+; `raiser.cpp` Phase 4; landed alongside the matmul_fp16_16x16 fix).
 ;
-; Divergence-triggered `v_writelane_b32` rewrite contract.
+; Before the raiser initialised ttmp7 this kernel's `s_and_b32 sN,
+; ttmp7, 0xffff` read an uninitialised SGPR, so downstream lifted-IR
+; consumers of `workgroup_id_y` always saw 0 — a kernel launched
+; with a 2D grid wrote only its Y=0 column of workgroups, leaving
+; the rest of the output at whatever the destination memory held at
+; dispatch (verified empirically on `matmul_kernel_16x16` under
+; compare_correctness: cols 0..15 match the CPU reference, cols
+; 16..31 retain the host's pre-launch `0xCD` poison fill).
 ;
-; REWRITE path (--enable-writelane-rewrite on):
-;   * `rewriteCrossLaneDivergent` in
-;     `rewrite_cross_lane_divergent.cpp` replaces the
-;     `@llvm.amdgcn.writelane` call with
-;       `select ((lane_id & (W_s-1)) == lane_idx), val_div, old`
-;     preceded by the canonical `mbcnt_lo(-1, 0); mbcnt_hi(-1, prev)`
-;     target-wave lane_id construction in the function's entry block.
-;   * Asserts the four stable signatures:
-;       (a) the `cwd_lane_id_lo` + `cwd_lane_id` two-step mbcnt pair
-;           (rewriter-specific variable names — distinct from the
-;           raiser's `lane_lo` / `lane_id` EXEC-mask-predication pair
-;           around cross-lane primitive sites),
-;       (b) the `cwd_wl_mask` lane-equality predicate,
-;       (c) the `cwd_writelane_rewritten` select,
-;       (d) the absence of any `cwd_readlane_rewritten` sibling
-;           (read half must NOT fire on this fixture).
-;
-; UNCHANGED path (flag off -> commit 1 default-off invariant):
-;   * `@llvm.amdgcn.writelane` survives verbatim; the rewrite-emitted
-;     `cwd_*` values are absent (the raiser's own SPE-wrapper lane_id
-;     construction for EXEC-mask predication still appears — that
-;     machinery is ORTHOGONAL to the rewrite pass and predates it, so
-;     we key the negative assertion on the rewriter-specific prefix
-;     `cwd_` rather than on `mbcnt`). Regression guard for commit 1's
-;     "no behaviour change when the flag is off" contract; once
-;     commit 2 flips the classifier to accept rewrite-implemented paths
-;     under the flag, this arm continues to prove the default-off
-;     plumbing works.
+; We assert:
+;   1) The raise succeeds (no %not; the RUN line fails the test if
+;      raise_cli returns non-zero).
+;   2) The lifted IR contains both `@llvm.amdgcn.workgroup.id.y`
+;      and `@llvm.amdgcn.workgroup.id.z` calls at kernel entry.
+;      Checking for both simultaneously pins BOTH halves of the
+;      packed ttmp7 layout — a regression that drops the Z-shift
+;      (e.g. forgets to include Z) would pass a Y-only check and
+;      silently miscompile 3D-grid kernels on the rarer Z>0
+;      launches.
+;   3) The IR packs them via `shl i32 {{.*}}, 16` (the Z<<16
+;      portion), pinning the exact encoding the AMDGPU backend's
+;      `AMDGPULegalizerInfo::loadInputValue` requires.
 
-; REWRITE-LABEL: define amdgpu_kernel void @writelane_divergent_rewrite_kernel(
-; REWRITE: %cwd_lane_id_lo = call i32 @llvm.amdgcn.mbcnt.lo
-; REWRITE: %cwd_lane_id = call i32 @llvm.amdgcn.mbcnt.hi
-; REWRITE: %cwd_wl_mask = icmp eq
-; REWRITE: %cwd_writelane_rewritten = select i1
-; REWRITE-NOT: cwd_readlane_rewritten
-
-; UNCHANGED-LABEL: define amdgpu_kernel void @writelane_divergent_rewrite_kernel(
-; UNCHANGED: call i32 @llvm.amdgcn.writelane
-; UNCHANGED-NOT: cwd_lane_id_lo
-; UNCHANGED-NOT: cwd_writelane_rewritten
+; IR-LABEL: define amdgpu_kernel void @ttmp7_wg_id_y_kernel(
+;
+; We pin the FULL `(Z << 16) | (Y & 0xFFFF)` dataflow from the two
+; workgroup.id intrinsics to the `or` that combines them.  Capture
+; variables tie the shift / mask operands to the specific intrinsic
+; results so a regression that shifted Y (instead of Z) by 16, or
+; masked Z (instead of Y) with 0xFFFF, would fail the check.
+;
+; Note: we don't CHECK for the `store i32 %ttmp7_val, ptr %ttmp_7`
+; into the raiser's ttmp[7] alloca; that store is routinely deleted
+; by LLVM's mem2reg pass that runs before `emit-ir` prints, so the
+; SSA value flows directly from `or` into the consumer side of the
+; kernel body (the inline-asm `s_and ttmp7, 0xffff` lift).  The
+; combined `or` shape plus the `@llvm.amdgcn.workgroup.id.{y,z}`
+; anchors above are the robust regression fence.
+;
+; The capture regex is anchored on the `ttmp7_wg_id_{y,z}` prefix
+; produced by `raiser.cpp`'s `B.CreateCall(fn..., {}, "ttmp7_wg_id_y")`
+; name.  Without the prefix anchor IR-DAG would match an EARLIER
+; `@llvm.amdgcn.workgroup.id.y()` call the raiser emits for the s3
+; SGPR alloca path (that one is named `%wg_id_y`), and the
+; downstream `and [[WG_Y]], 65535` check would then fail because
+; the actual AND consumes the SECOND call's result.  If a future
+; refactor renames these SSA values, update the anchor here.
+; IR-DAG: [[WG_Y:%ttmp7_wg_id_y[a-zA-Z0-9_.]*]] = call i32 @llvm.amdgcn.workgroup.id.y()
+; IR-DAG: [[WG_Z:%ttmp7_wg_id_z[a-zA-Z0-9_.]*]] = call i32 @llvm.amdgcn.workgroup.id.z()
+; IR:     [[Y_LO:%[a-zA-Z0-9_.]+]] = and i32 [[WG_Y]], 65535
+; IR:     [[Z_HI:%[a-zA-Z0-9_.]+]] = shl i32 [[WG_Z]], 16
+; IR:     {{%[a-zA-Z0-9_.]+}} = or i32 [[Y_LO]], [[Z_HI]]
 
 	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
 	.amdhsa_code_object_version 6
 	.text
-	.globl	writelane_divergent_rewrite_kernel
+	.globl	ttmp7_wg_id_y_kernel
 	.p2align	8
-	.type	writelane_divergent_rewrite_kernel,@function
-writelane_divergent_rewrite_kernel:     ; @writelane_divergent_rewrite_kernel
+	.type	ttmp7_wg_id_y_kernel,@function
+ttmp7_wg_id_y_kernel:                   ; @ttmp7_wg_id_y_kernel
 ; %bb.0:
 	s_clause 0x1
 	s_load_b32 s4, s[0:1], 0x14
@@ -78,19 +85,15 @@ writelane_divergent_rewrite_kernel:     ; @writelane_divergent_rewrite_kernel
 	s_cselect_b32 s0, ttmp9, s1
 	v_mad_u32 v0, s0, s4, v0
 	;;#ASMSTART
-	s_bfe_u32 s0, ttmp8, 0x50019
+	s_and_b32 s0, ttmp7, 0xffff
 	
 	;;#ASMEND
-	;;#ASMSTART
-	v_writelane_b32 v1, s0, 0
-	
-	;;#ASMEND
-	v_xor_b32_e32 v1, s0, v1
+	v_mov_b32_e32 v1, s0
 	global_store_b32 v0, v1, s[2:3] scale_offset
 	s_endpgm
 	.section	.rodata,"a",@progbits
 	.p2align	6, 0x0
-	.amdhsa_kernel writelane_divergent_rewrite_kernel
+	.amdhsa_kernel ttmp7_wg_id_y_kernel
 		.amdhsa_group_segment_fixed_size 0
 		.amdhsa_private_segment_fixed_size 0
 		.amdhsa_kernarg_size 264
@@ -190,11 +193,11 @@ amdhsa.kernels:
       - 2
       - 0
     .max_flat_workgroup_size: 1024
-    .name:           writelane_divergent_rewrite_kernel
+    .name:           ttmp7_wg_id_y_kernel
     .private_segment_fixed_size: 0
     .sgpr_count:     6
     .sgpr_spill_count: 0
-    .symbol:         writelane_divergent_rewrite_kernel.kd
+    .symbol:         ttmp7_wg_id_y_kernel.kd
     .uniform_work_group_size: 1
     .uses_dynamic_stack: false
     .vgpr_count:     2
