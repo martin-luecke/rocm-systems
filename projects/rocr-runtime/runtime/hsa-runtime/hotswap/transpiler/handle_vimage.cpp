@@ -282,8 +282,9 @@ HandlerResult handleVIMAGE(RaiseContext &ctx, const DecodedInst &di,
   // helper has no target cache-policy encoding to preserve. The
   // descriptor-visible side effects, including atomic-barrier updates,
   // live in the D# groups that are forwarded.
-  ctx.B.CreateCall(helper,
-                   {args.grp0, args.grp1, args.grp2, args.grp3});
+  ctx.emitUnderExec([&] {
+    ctx.B.CreateCall(helper, {args.grp0, args.grp1, args.grp2, args.grp3});
+  });
   hr.handled = true;
   return hr;
 }

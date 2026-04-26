@@ -121,6 +121,10 @@ the authoritative spec):
   (W = `__builtin_amdgcn_wavefrontsize()`); X is unique per
   lane so the stripe is race-free on both the global and LDS
   sides.
+- **EXEC gating.** The handler wraps each helper call in
+  `RaiseContext::emitUnderExec`, so inactive modeled source lanes skip
+  the entire descriptor walk even when the target projection keeps
+  hardware EXEC widened between side-effect diamonds.
 - **Atomic-barrier side effect** (descriptor group 1 field) is gated
   to lane 0.
 
