@@ -114,45 +114,16 @@ v_dual_cndmask_b32_sgpr_cond_kernel:    ; @v_dual_cndmask_b32_sgpr_cond_kernel
 	.section	.rodata,"a",@progbits
 	.p2align	6, 0x0
 	.amdhsa_kernel v_dual_cndmask_b32_sgpr_cond_kernel
-		.amdhsa_group_segment_fixed_size 0
-		.amdhsa_private_segment_fixed_size 0
 		.amdhsa_kernarg_size 16
 		.amdhsa_user_sgpr_count 2
-		.amdhsa_user_sgpr_dispatch_ptr 0
-		.amdhsa_user_sgpr_queue_ptr 0
 		.amdhsa_user_sgpr_kernarg_segment_ptr 1
-		.amdhsa_user_sgpr_dispatch_id 0
-		.amdhsa_user_sgpr_kernarg_preload_length 0
-		.amdhsa_user_sgpr_kernarg_preload_offset 0
-		.amdhsa_user_sgpr_private_segment_size 0
 		.amdhsa_wavefront_size32 1
-		.amdhsa_uses_dynamic_stack 0
-		.amdhsa_enable_private_segment 0
 		.amdhsa_system_sgpr_workgroup_id_x 1
-		.amdhsa_system_sgpr_workgroup_id_y 0
-		.amdhsa_system_sgpr_workgroup_id_z 0
-		.amdhsa_system_sgpr_workgroup_info 0
-		.amdhsa_system_vgpr_workitem_id 0
 		.amdhsa_next_free_vgpr 8
 		.amdhsa_next_free_sgpr 8
-		.amdhsa_named_barrier_count 0
 		.amdhsa_reserve_vcc 1
-		.amdhsa_float_round_mode_32 0
-		.amdhsa_float_round_mode_16_64 0
 		.amdhsa_float_denorm_mode_32 3
-		.amdhsa_float_denorm_mode_16_64 3
-		.amdhsa_fp16_overflow 0
-		.amdhsa_memory_ordered 1
-		.amdhsa_forward_progress 1
 		.amdhsa_inst_pref_size 1
-		.amdhsa_round_robin_scheduling 0
-		.amdhsa_exception_fp_ieee_invalid_op 0
-		.amdhsa_exception_fp_denorm_src 0
-		.amdhsa_exception_fp_ieee_div_zero 0
-		.amdhsa_exception_fp_ieee_overflow 0
-		.amdhsa_exception_fp_ieee_underflow 0
-		.amdhsa_exception_fp_ieee_inexact 0
-		.amdhsa_exception_int_div_zero 0
 	.end_amdhsa_kernel
 	.text
 	.p2alignl 7, 3214868480
@@ -173,25 +144,15 @@ amdhsa.kernels:
     .group_segment_fixed_size: 0
     .kernarg_segment_align: 8
     .kernarg_segment_size: 16
-    .language:       OpenCL C
-    .language_version:
-      - 2
-      - 0
     .max_flat_workgroup_size: 1024
     .name:           v_dual_cndmask_b32_sgpr_cond_kernel
     .private_segment_fixed_size: 0
     .sgpr_count:     10
-    .sgpr_spill_count: 0
     .symbol:         v_dual_cndmask_b32_sgpr_cond_kernel.kd
-    .uniform_work_group_size: 1
-    .uses_dynamic_stack: false
     .vgpr_count:     8
-    .vgpr_spill_count: 0
     .wavefront_size: 32
 amdhsa.target:   amdgcn-amd-amdhsa--gfx1250
-amdhsa.version:
-  - 1
-  - 2
+amdhsa.version: [1, 2]
 ...
 
 	.end_amdgpu_metadata
