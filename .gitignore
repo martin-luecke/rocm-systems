@@ -7,6 +7,15 @@ triton/
 !/projects/rocr-runtime/runtime/hsa-runtime/hotswap/transpiler/tools/compare_correctness/kernels/triton/
 __pycache__/
 *.pyc
+# Local rocm-7 venv used by tools/triton_corpus_runner; created on demand
+# from the PyTorch nightly index (see its README).  Several GB of binaries.
+/projects/rocr-runtime/runtime/hsa-runtime/hotswap/transpiler/tools/triton_corpus_runner/.venv-rocm7/
+# tools/aiter_corpus_runner: auto-cloned AITER source, JIT compile cache,
+# and (optionally) a sibling rocm-7 venv if the user opts not to share the
+# triton_corpus_runner one.  All several GB or large source trees.
+/projects/rocr-runtime/runtime/hsa-runtime/hotswap/transpiler/tools/aiter_corpus_runner/_aiter/
+/projects/rocr-runtime/runtime/hsa-runtime/hotswap/transpiler/tools/aiter_corpus_runner/_jit_cache/
+/projects/rocr-runtime/runtime/hsa-runtime/hotswap/transpiler/tools/aiter_corpus_runner/.venv-rocm7/
 /projects/rocr-runtime/runtime/hsa-runtime/hotswap/transpiler/scope_discovery/
 /projects/rocr-runtime/runtime/hsa-runtime/hotswap/transpiler/SPE_DESIGN.md
 /projects/rocr-runtime/runtime/hsa-runtime/hotswap/transpiler/CROSS_LANE_SURVEY.md
