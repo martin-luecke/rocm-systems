@@ -310,27 +310,28 @@ direct.
   this commit touches (the `opcode_map` entry,
   `handle_sopp.cpp`'s new explicit arm, the shared operand
   decode in `handle_flat.cpp`).
-* **Empirical (manual).**  All four `_matmul_ogs_*.hsaco`
-  kernels from `scope_discovery/kernels/` raise end-to-end on
-  `--isa=gfx1250 --target-isa=gfx942`.  Running
-  `raise_cli <file> --isa=gfx1250 --target-isa=gfx942` on each
-  reports `OK ... (N/N)` for N ∈ {1670, 1232, 860, 389}.
-  This is the empirical-unblocking signal the task targeted;
-  a dedicated GTest covering the `scope_discovery/kernels/`
-  directory is TODO (see §6).
+* **Empirical (GTest-gated).**  `BatchRaise.ScopeDiscoveryGptOss`
+  parses `scope_discovery/kernels/manifest.jsonl`, keeps only
+  `status:"ok"` `_matmul_ogs_*.hsaco` entries, and raises the
+  four GPT-OSS MoE expert-GEMM kernels end-to-end on
+  `--isa=gfx1250 --target-isa=gfx942` with `expectedFailures = 0`.
+  This turns the manual `raise_cli <file> ...` sweep
+  (`OK ... (N/N)` for N ∈ {1670, 1232, 860, 389}) into a CI
+  regression gate: removing the FLAT async-load SemOp mapping
+  or synchronous cross-target emulation makes the GTest fail
+  loudly.
 
 ## 6. Known gaps / follow-ups
 
-* **No dedicated GTest for the matmul_ogs surface.**  The
-  `scope_discovery/kernels/` directory is not currently wired
-  into any CMake-level test_data path.  A minimal
-  `BatchRaise.ScopeDiscoveryGPT_OSS` test that walks those
-  four HSACOs would turn the manual command-line
-  verification into a CI regression gate.  Left as
-  follow-up — the manual verification in §5 is sufficient
-  for this commit, and adding a new test_data directory +
-  CMake wiring is outside the scope of "implement the
-  emulation".
+* **Matmul_ogs lift gate closed.**  `BatchRaise.ScopeDiscoveryGptOss`
+  now wires `scope_discovery/kernels/` into the GTest binary,
+  discovers the four manifest-ok `_matmul_ogs_*.hsaco` kernels
+  from `manifest.jsonl`, and requires a 0-failure gfx1250 →
+  gfx942 raise.  The test is intentionally narrower than the
+  full scope-discovery directory because that directory also
+  contains unrelated Triton/GPT-OSS surfaces with pre-existing
+  non-async-copy failures; the north-star async-copy consumers
+  are now CI-gated directly.
 * **Non-zero `flat_offset` not exercised in lit.**  Every
   async load in both the HIP fixture and the observed corpus
   has `flat_offset = 0`, so the `async_gptr_off` /
