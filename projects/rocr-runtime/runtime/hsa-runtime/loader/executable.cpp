@@ -1427,14 +1427,8 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
                     << " — falling through to .note scan\n";
         }
       }
-      // Read the original e_flags MACH value before any patching
+      // If EI_PAD did not identify the source ISA, scan note metadata next.
       if (!isaOverridden && elfSz >= 52) {
-        uint32_t e_flags = 0;
-        std::memcpy(&e_flags, elfBytes + 48, 4);
-        uint32_t mach = e_flags & 0xFF;
-        // Check if the mach matches the target. If HIP patched it, mach
-        // will equal the target. But we need to check the .note ISA string
-        // which wasn't patched.
         // Scan for NT_AMDGPU_ISA note (type 27) with original gfx name
         uint64_t shoff = 0;
         uint16_t shentsz = 0, shnum = 0;
@@ -1587,6 +1581,19 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
                     << ",\"total_count\":" << irResult.totalCount
                     << ",\"fail_mnemonic\":\""
                     << JsonEscape(irResult.failMnemonic) << "\"";
+              if (!irResult.failKernel.empty())
+                proof << ",\"fail_kernel\":\""
+                      << JsonEscape(irResult.failKernel) << "\"";
+              if (!irResult.failReason.empty())
+                proof << ",\"fail_reason\":\""
+                      << JsonEscape(irResult.failReason) << "\"";
+              if (!irResult.failFormat.empty())
+                proof << ",\"fail_format\":\""
+                      << JsonEscape(irResult.failFormat) << "\"";
+              if (!irResult.failDetail.empty())
+                proof << ",\"fail_detail\":\""
+                      << JsonEscape(irResult.failDetail) << "\"";
+              proof << ",\"fail_offset\":" << irResult.failOffset;
               AppendSalmonProofJson(proof.str());
             }
             return HSA_STATUS_ERROR;
