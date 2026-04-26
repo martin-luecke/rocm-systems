@@ -290,9 +290,8 @@ direct.
 
 * **Lit.**
   `lit_tests/global_load_async_to_lds/global_load_async_to_lds.ll`
-  pins the cross-target IR shape for all three widths it
-  exercises (`b32` / `b64` / `b128` — `b8` is covered
-  transitively through the SemOp switch arm).  It asserts the
+  pins the cross-target IR shape for all four widths
+  (`b8` / `b32` / `b64` / `b128`).  It asserts the
   per-width `load <T>` + `store <T>` pair, the
   `scale_offset`-derived multiplier, the LDS-base
   `inttoptr i32` cast, AND a negative assertion that the
@@ -344,6 +343,13 @@ direct.
   §2 / §3.1: `INST_OFFSET` contributes to both `dsaddr` and
   `memaddr`, so the cross-target synchronous emulation must
   apply the same byte offset to both pointers.
+* **b8 width lit gap closed.**  The
+  `global_load_async_to_lds/` fixture now drives
+  `__builtin_amdgcn_global_load_async_to_lds_b8` directly and
+  checks the cross-target `load i8` / `store i8` shape with
+  align 1, plus the same-target b8 intrinsic call.  The b8 case
+  is therefore no longer covered only by inspection of the
+  width switch in `handle_flat.cpp`.
 * **cpol `th` / `scope` bits silently dropped.**  Per §3.4,
   these are tuning hints without a gfx942 equivalent.  If a
   future corpus kernel turns out to depend on them for
