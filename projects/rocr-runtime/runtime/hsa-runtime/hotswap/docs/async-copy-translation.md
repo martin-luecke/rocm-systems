@@ -300,7 +300,12 @@ direct.
   (`IR-NOT: @llvm.amdgcn.global.load.async.to.lds.b*`).
   The companion
   `global_load_async_to_lds_same_target.ll` fixture (unchanged)
-  keeps the same-target intrinsic-emit shape pinned.
+  keeps the same-target intrinsic-emit shape pinned.  The
+  `global_load_async_to_lds_offset/` fixture closes the
+  non-zero `flat_offset` branch directly: it compiles a b32
+  async load with `offset = 16` and requires BOTH the global
+  pointer and the LDS pointer to carry matching i8-GEPs before
+  the load/store pair.
 * **Batch raise.**
   `BatchRaise.Gfx1250TestData` and `BatchRaise.AiterGfx950`
   both continue to raise 100 % of their kernels (20 / 20 and
@@ -332,14 +337,13 @@ direct.
   contains unrelated Triton/GPT-OSS surfaces with pre-existing
   non-async-copy failures; the north-star async-copy consumers
   are now CI-gated directly.
-* **Non-zero `flat_offset` not exercised in lit.**  Every
-  async load in both the HIP fixture and the observed corpus
-  has `flat_offset = 0`, so the `async_gptr_off` /
-  `async_lptr_off` GEP branch is covered only by the
-  conditional itself (and a reading of the code).  A targeted
-  fixture with a non-zero offset would pin that branch; not
-  urgent, but worth adding when a corpus kernel with a
-  non-zero offset surfaces.
+* **Non-zero `flat_offset` lit gap closed.**  The
+  `global_load_async_to_lds_offset/` fixture now pins the
+  `async_gptr_off` / `async_lptr_off` GEP branch with a literal
+  `offset = 16`.  This directly tests the ISA contract from
+  §2 / §3.1: `INST_OFFSET` contributes to both `dsaddr` and
+  `memaddr`, so the cross-target synchronous emulation must
+  apply the same byte offset to both pointers.
 * **cpol `th` / `scope` bits silently dropped.**  Per §3.4,
   these are tuning hints without a gfx942 equivalent.  If a
   future corpus kernel turns out to depend on them for
