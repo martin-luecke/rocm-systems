@@ -54,6 +54,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <atomic>
 #include <fstream>
 #include "inc/amd_hsa_elf.h"
@@ -182,6 +183,38 @@ void LoaderOptions::PrintHelp(std::ostream& out) const
 }
 
 static const char *LOADER_DUMP_PREFIX = "amdcode";
+
+#ifdef ROCR_HOTSWAP_ENABLED
+static std::string JsonEscape(const std::string& s) {
+  std::ostringstream os;
+  for (char c : s) {
+    switch (c) {
+      case '\\': os << "\\\\"; break;
+      case '"': os << "\\\""; break;
+      case '\n': os << "\\n"; break;
+      case '\r': os << "\\r"; break;
+      case '\t': os << "\\t"; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          os << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+             << static_cast<unsigned>(static_cast<unsigned char>(c))
+             << std::dec << std::setfill(' ');
+        } else {
+          os << c;
+        }
+    }
+  }
+  return os.str();
+}
+
+static void AppendSalmonProofJson(const std::string& jsonFields) {
+  const char* path = std::getenv("HSA_SALMON_PROOF_LOG");
+  if (!path || !path[0]) return;
+  std::ofstream out(path, std::ios::app);
+  if (!out) return;
+  out << "{" << jsonFields << "}\n";
+}
+#endif
 
 Loader* Loader::Create(Context* context)
 {
@@ -1373,6 +1406,17 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
         if (origGfx && std::string(origGfx) != hotswapTargetGfx) {
           isaOverridden = true;
           hotswapOriginalIsa = std::string("amdgcn-amd-amdhsa--") + origGfx;
+          {
+            std::ostringstream proof;
+            proof << "\"event\":\"transpile_decision\""
+                  << ",\"source\":\"loader_ei_pad\""
+                  << ",\"source_gfx\":\"" << JsonEscape(origGfx) << "\""
+                  << ",\"target_gfx\":\"" << JsonEscape(hotswapTargetGfx) << "\""
+                  << ",\"orig_mach\":\"0x" << std::hex
+                  << static_cast<unsigned>(orig_mach) << std::dec << "\""
+                  << ",\"code_isa\":\"" << JsonEscape(codeIsa) << "\"";
+            AppendSalmonProofJson(proof.str());
+          }
           std::cerr << "hotswap: salmon EI_PAD original ISA=" << origGfx
                     << " (mach=0x" << std::hex << static_cast<unsigned>(orig_mach)
                     << std::dec << ") != target " << hotswapTargetGfx
@@ -1504,6 +1548,9 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
           if (srcGfx.empty() || tgtGfx.empty()) {
             std::cerr << "salmon: cannot extract gfx target from ISA strings ("
                       << sourceIsa << " / " << agentIsaName << ")\n";
+            AppendSalmonProofJson(
+                "\"event\":\"salmon_result\",\"success\":false,"
+                "\"reason\":\"cannot_extract_gfx\"");
             return HSA_STATUS_ERROR;
           }
 
@@ -1529,6 +1576,19 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
             if (!irResult.failMnemonic.empty())
               std::cerr << "salmon: unsupported instruction: "
                         << irResult.failMnemonic << "\n";
+            {
+              std::ostringstream proof;
+              proof << "\"event\":\"salmon_result\""
+                    << ",\"success\":false"
+                    << ",\"source_gfx\":\"" << JsonEscape(srcGfx) << "\""
+                    << ",\"target_gfx\":\"" << JsonEscape(tgtGfx) << "\""
+                    << ",\"elf_size\":" << elfSize
+                    << ",\"lifted_count\":" << irResult.liftedCount
+                    << ",\"total_count\":" << irResult.totalCount
+                    << ",\"fail_mnemonic\":\""
+                    << JsonEscape(irResult.failMnemonic) << "\"";
+              AppendSalmonProofJson(proof.str());
+            }
             return HSA_STATUS_ERROR;
           }
 
@@ -1545,6 +1605,17 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
           std::cerr << "salmon: OK (" << srcGfx << " -> " << tgtGfx << ", "
                     << irResult.liftedCount << "/" << irResult.totalCount
                     << " instructions, " << elfSize << " bytes)\n";
+          {
+            std::ostringstream proof;
+            proof << "\"event\":\"salmon_result\""
+                  << ",\"success\":true"
+                  << ",\"source_gfx\":\"" << JsonEscape(srcGfx) << "\""
+                  << ",\"target_gfx\":\"" << JsonEscape(tgtGfx) << "\""
+                  << ",\"elf_size\":" << elfSize
+                  << ",\"lifted_count\":" << irResult.liftedCount
+                  << ",\"total_count\":" << irResult.totalCount;
+            AppendSalmonProofJson(proof.str());
+          }
         } else
 #endif // ROCR_HOTSWAP_IR_RAISER
         if (rocr::hotswap::NeedsTranspile(sourceIsa, agentIsaName)) {
