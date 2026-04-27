@@ -173,9 +173,8 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
   // matches the dword-granular s_load_* family (sbase + imm-or-sgpr
   // offset), so operand decoding mirrors the S_LOAD_B* block above.
   //
-  // Design notes (Position-α permissive lift, 2026-04-19):
-  // ------------------------------------------------------
-  //  * IR shape: `load iN, ptr addrspace(1) %p, align N` + `zext`/`sext`
+  // Design notes:
+  //  * IR shape: `load iN, ptr addrspace(4|1) %p, align N` + `zext`/`sext`
   //    to i32 → `storeSGPR32`. No AMDGPU-specific intrinsic exists for
   //    narrow scalar loads; the backend's ISel matches the uniform-address
   //    pattern directly.
@@ -186,29 +185,22 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
   //    The lifted kernel stays correct — the value appears on every lane
   //    with the same content, matching the SMEM broadcast semantics —
   //    but the register class shifts SGPR→VGPR and the memory path
-  //    shifts scalar-cache→vector-cache. We permit this demotion rather
-  //    than refuse, because `load iN` IR is a semantically well-defined
-  //    lift (no silent miscompile), and the backend's VMEM choice is the
-  //    architecturally-correct lowering on an ISA without scalar narrow
-  //    loads. Consumers that require SMEM uniformity should gate their
-  //    lift pipeline on same-target at the raiser level, not here.
-  //  * Alignment: explicit `Align(1)` for byte, `Align(2)` for halfword,
-  //    mirroring the principled pattern handle_flat.cpp uses for
-  //    GLOBAL_LOAD sub-dword. Omitting this would let the IRBuilder
-  //    infer ABI alignment, which happens to match today but is fragile
-  //    against LLVM default-alignment changes.
-  //  * Kernarg-pointer defensive refusal: a narrow load through the
-  //    kernarg pointer (sbase == s[0:1]) is refused loudly. Kernarg
-  //    layouts in Salmon's metadata are dword-granular (see
-  //    `extractKernargDword` in kernarg_layout.cpp); sub-dword extraction
-  //    would require special-case bitfield logic that no corpus kernel
-  //    exercises today. If a future kernel does hit this shape, a loud
-  //    failure is better than silently decomposing a dword slot.
+  //    shifts scalar-cache→vector-cache.
+  //  * Alignment: explicit `Align(1)` for byte, `Align(2)` for halfword.
+  //  * Kernarg-pair sbase: same addrspace-hint policy as the wide
+  //    S_LOAD_B* path above. Kernarg-derived sbase → `addrspace(4)` so
+  //    the backend selects an SMEM narrow load against the kernarg
+  //    segment (`s_load_u8/u16` on gfx12+, VMEM cross-target);
+  //    otherwise → `addrspace(1)`. The narrow case used to refuse here
+  //    because the old slot-table extraction couldn't synthesise
+  //    sub-dword reads from typed IR Function args; with the kernarg
+  //    ABI lowering offloaded to LLVM, no extraction is needed and
+  //    Mluecke's narrow-by-value Triton kernels (e.g. matmul_ogs_dot
+  //    with packed scalar params) lift uniformly.
   //
   // Test back-reference: lit_tests/s_load_u16/ exercises the halfword
-  // same-target happy path (`s_load_u16 s*, s*, 0x*` → `load i16 align 2 +
-  // zext`). The byte (u8/i8) and signed (i8/i16) variants are covered
-  // transitively by the shared handler.
+  // same-target happy path. The byte (u8/i8) and signed (i8/i16)
+  // variants share this handler body.
   if (sop == SemOp::S_LOAD_U8 || sop == SemOp::S_LOAD_I8 ||
       sop == SemOp::S_LOAD_U16 || sop == SemOp::S_LOAD_I16) {
     bool isHalfWord =
@@ -224,46 +216,18 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
     ParsedReg dest = op.dst();
     ParsedReg base = op.srcReg(0);
 
-    // Defensive refusal: narrow load against the kernarg pointer would
-    // require sub-dword extraction from a dword-granular kernarg layout.
-    // Uses the same layout-driven kernarg-pointer detection as the
-    // S_LOAD_B* path above (see `getKernargPtrSgpr` for the rationale);
-    // keeping the two call sites identical guarantees that whether a
-    // given sbase is treated as "the kernarg pointer" is a single
-    // source-ABI question, not two independently-drifted heuristics.
     int kernargPtrSgpr = getKernargPtrSgpr(ctx);
     bool baseIsKernargPair =
         (base.kind == ParsedReg::SGPR && kernargPtrSgpr >= 0 &&
          base.baseIdx == kernargPtrSgpr);
-    auto pairKind = kernargPairProvenance(ctx, kernargPtrSgpr).kind;
     bool isKernarg =
         baseIsKernargPair &&
-        pairKind == RaiseContext::SgprKernargProvenance::Kind::Kernarg;
-    if (baseIsKernargPair &&
-        pairKind == RaiseContext::SgprKernargProvenance::Kind::Unknown) {
-      llvm::errs()
-          << "transpiler: " << di.mnemonic << ": kernarg-pair SGPR (s["
-          << kernargPtrSgpr << ":" << (kernargPtrSgpr + 1)
-          << "]) has unknown provenance at this narrow load site; refusing "
-             "rather than dereferencing a possibly sentinel-seeded kernarg "
-             "pointer value\n";
-      hr.failure = RaiseFailure::smemKernargMiss(di);
-      return hr;
-    }
-    if (isKernarg) {
-      llvm::errs() << "transpiler: " << di.mnemonic
-                   << ": narrow scalar load directly off the kernarg pointer "
-                      "is not supported (would need sub-dword extraction from "
-                      "the dword-granular kernarg layout)\n";
-      hr.failure = RaiseFailure::unsupportedShape(
-          di, "SMEM",
-          "narrow s_load_* against the kernarg pointer would require "
-          "sub-dword extraction from the dword-granular kernarg layout");
-      return hr;
-    }
-
+        kernargPairProvenance(ctx, kernargPtrSgpr).kind ==
+            RaiseContext::SgprKernargProvenance::Kind::Kernarg;
+    llvm::Type *ptrTy = isKernarg ? llvm::PointerType::get(ctx.C, 4)
+                                  : ctx.ptrGlobalTy;
     Value *baseAddr = ctx.regs.loadSGPR64(ctx.B, base.baseIdx);
-    Value *ptr = ctx.B.CreateIntToPtr(baseAddr, ctx.ptrGlobalTy);
+    Value *ptr = ctx.B.CreateIntToPtr(baseAddr, ptrTy);
     unsigned offIdx = op.srcIdx(1);
     if (di.isImm(offIdx)) {
       int64_t off = op.srcImm(1);
