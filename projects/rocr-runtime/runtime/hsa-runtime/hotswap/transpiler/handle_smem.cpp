@@ -1,5 +1,7 @@
 #include "handlers.hpp"
+#include "pipeline.hpp" // isStrictMode()
 
+#include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <cassert>
@@ -112,6 +114,59 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
         baseIsKernargPair &&
         kernargPairProvenance(ctx, kernargPtrSgpr).kind ==
             RaiseContext::SgprKernargProvenance::Kind::Kernarg;
+
+    // Implicit-args reroute. AMDGPU separates the explicit kernarg
+    // segment from the implicit-arg block: the latter is reachable via
+    // `amdgcn_implicitarg_ptr`, not via offsets past the end of the
+    // kernarg segment. A source kernel that issues
+    // `s_load_b* sN, kernarg_pair, off` with `off >= implicitArgsBase`
+    // is reading hidden args through the source-ABI flat layout; the
+    // lifted kernel must materialise those bytes via the implicit-arg
+    // pointer with the offset rebased to `off - implicitArgsBase`.
+    //
+    // Strict-mode refusal: in `HSA_SALMON_STRICT=1` the cross-arch
+    // implicit-arg layout is not yet proven equivalent for every
+    // `(source ISA, target ISA)` pair we lift between, so the
+    // pipeline refuses to silently substitute a target-ABI implicit
+    // arg for a source-ABI one. In permissive mode we trust the
+    // ROCm convention that the layouts match (both gfx9-12 follow
+    // the same `hidden_*` block).
+    //
+    // Required guards: `isKernarg` + `immOffset` + a positive
+    // `implicitArgsBase`. Without those, the offset doesn't denote
+    // an implicit-arg slot and we fall through to the generic
+    // kernarg/global path.
+    if (isKernarg && immOffset && ctx.kernargs.implicitArgsBase > 0 &&
+        byteOffset >= ctx.kernargs.implicitArgsBase) {
+      if (isStrictMode()) {
+        hr.failure = RaiseFailure::strictUnsafeLowering(
+            di, "implicitarg.ptr",
+            "cross-arch implicitarg.ptr lowering is unresolved: source "
+            "implicit-arg offsets are being applied to the target runtime "
+            "hidden-arg block");
+        return hr;
+      }
+      Function *fnImplicitArgPtr = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::amdgcn_implicitarg_ptr);
+      Value *implPtr =
+          ctx.B.CreateCall(fnImplicitArgPtr, {}, "implicitarg_ptr");
+      int64_t implOffset = byteOffset - ctx.kernargs.implicitArgsBase;
+      Value *gep =
+          (implOffset == 0)
+              ? implPtr
+              : ctx.B.CreateInBoundsGEP(ctx.i8Ty, implPtr,
+                                         ctx.B.getInt64(implOffset),
+                                         "impl_gep");
+      for (int d = 0; d < loadDwords; d++) {
+        Value *ep = (d == 0) ? gep
+                             : ctx.B.CreateInBoundsGEP(
+                                   ctx.i8Ty, gep, ctx.B.getInt64(d * 4));
+        ctx.regs.storeSGPR32(ctx.B, dest.baseIdx + d,
+                             ctx.B.CreateLoad(ctx.i32Ty, ep, "impl_load"));
+      }
+      hr.handled = true;
+      return hr;
+    }
 
     // The kernarg SGPR pair is seeded with `ptrtoint(amdgcn_kernarg_segment_ptr)`
     // in `raiser.cpp` Phase 4, so the generic GEP+load path serves every

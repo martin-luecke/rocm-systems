@@ -15,9 +15,14 @@ namespace transpiler {
 // and the AMDGPU backend handles the ABI lowering. This struct keeps
 // only the two pieces of metadata that survive that move.
 struct KernargLayout {
-  // Byte offset where the implicit-arg block begins, copied from
-  // `meta.implicitArgsBase()`. Reserved for an implicit-arg lowering
-  // path (`amdgcn_implicitarg_ptr`) — currently informational only.
+  // Byte offset (within the source ABI's flat kernarg-segment view)
+  // where the implicit-arg block begins. `handle_smem.cpp` consults
+  // this to reroute SMEM loads at offsets >= implicitArgsBase through
+  // `amdgcn_implicitarg_ptr` instead of the kernarg-segment pointer:
+  // the source kernel's flat view is layout-correct for the source
+  // ABI, but the lifted target kernel reaches implicit args via a
+  // separate runtime pointer, so the offset must be rebased to
+  // `byteOffset - implicitArgsBase`.
   int implicitArgsBase = 0;
   // Total kernarg segment size in bytes, copied from the kernel
   // descriptor's `.kernarg_segment_size`. Informational; the lifted
