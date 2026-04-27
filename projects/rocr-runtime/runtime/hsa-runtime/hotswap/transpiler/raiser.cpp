@@ -1329,21 +1329,26 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
     return nullptr;
   };
   // Kernarg preload SGPRs carry dwords copied by hardware from the kernarg
-  // segment before kernel entry. Materialize the same dwords from the IR
-  // function args so early source-SGPR reads observe the descriptor-declared
-  // preload image.
+  // segment before kernel entry. Materialize the same dwords by loading
+  // through `amdgcn_kernarg_segment_ptr` so the AMDGPU backend handles the
+  // ABI lowering uniformly: the GEP+load lowers back to `s_load_b32` (or a
+  // hardware-preload SGPR read on gfx12+) against the kernarg segment, with
+  // identical bytes to what the source kernel saw at entry.
+  //
+  // Hidden block counts (Triton's hidden_block_count_* ABI) still need
+  // dispatch-packet synthesis since their values aren't stored in the
+  // kernarg segment at all — only `emitPreloadedHiddenKernargDword` can
+  // materialize them from `amdgcn_dispatch_ptr`.
   for (size_t sgprIdx = 0; sgprIdx < userSgprLayout.entries.size(); ++sgprIdx) {
     const auto &entry = userSgprLayout.entries[sgprIdx];
     if (entry.source != UserSgprLayout::Source::PreloadedKernarg)
       continue;
-    std::string why;
     Value *dw = emitPreloadedHiddenKernargDword(entry.kernargByteOffset);
-    if (!dw)
-      dw = extractKernargDword(kernargs, B, F, entry.kernargByteOffset, &why);
     if (!dw) {
-      report_fatal_error(Twine("transpiler: failed to seed preloaded kernarg SGPR s") +
-                         Twine(static_cast<int>(sgprIdx)) + " at byte offset " +
-                         Twine(entry.kernargByteOffset) + ": " + why);
+      Value *segPtr = B.CreateCall(fnKargPtr, {}, "preload_kernarg_ptr");
+      Value *gep = B.CreateInBoundsGEP(
+          i8Ty, segPtr, B.getInt64(entry.kernargByteOffset), "preload_gep");
+      dw = B.CreateAlignedLoad(i32Ty, gep, Align(4), "preload_dw");
     }
     regs.storeSGPR32(B, static_cast<int>(sgprIdx), dw);
   }
