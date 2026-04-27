@@ -222,6 +222,27 @@ Two inputs only the raiser has access to:
    `"amdgpu-lds-size"` / `addr-space-cast` approach ties this up at
    IR level — TODO below.
 
+### 4.2.1 Scratch/private-memory translation
+
+`scratch_*` instructions are not global-memory operations with a special
+base register. They are accesses to the source kernel's per-work-item
+private segment: the hardware swizzles the dword offset by lane and adds
+the wave's launch-time scratch base. The launch-time allocation is requested
+by the KD's `private_segment_fixed_size` plus
+`compute_pgm_rsrc2.ENABLE_PRIVATE_SEGMENT`; on gfx12 the source KD may also
+request `enable_sgpr_flat_scratch_init`, while gfx9/gfx942 target codegen for
+LLVM private memory normally emits scratch opcodes with
+`.amdhsa_enable_private_segment 1` rather than a user-SGPR flat-scratch pair.
+
+Salmon models this at the ABI layer by creating one addrspace(5) private
+frame for the source private segment, sized from the parsed source KD. A
+translated `scratch_load/store` becomes a load/store through a GEP inside
+that frame. This deliberately lets the target AMDGPU backend lay the source
+private frame out together with any target spills and emit the target KD's
+private-segment fields. Salmon refuses a `scratch_*` instruction when the
+source KD reports `private_segment_fixed_size == 0`, because inventing
+scratch backing would change the source launch ABI instead of translating it.
+
 ### 4.3 What changes at ISA boundary
 
 | Source (gfx1250) | Target (gfx950) | Strategy |
@@ -407,11 +428,12 @@ One struct field, one check in `raiseToIR` before Phase 2. 30 LoC.
 Post-raise pass over the IR walking `.rodata`-backed constants;
 reject on format-code anomalies. ~80 LoC.
 
-### T4 — Scratch attribute propagation
+### T4 — Scratch/private-segment propagation
 
-Forward `meta.privateSegmentFixedSize` through `KernargLayout` into a
-function attribute. One line in raiser, one line in the attribute
-plumbing. Verifies against target backend via `verifyModule`.
+Forward `meta.privateSegmentFixedSize` into `RaiseContext` and model real
+`scratch_*` instructions as addrspace(5) private-frame accesses. The target
+backend then emits the target KD's private segment request; unsupported
+subcases refuse with source KD scratch fields in the structured diagnostic.
 
 ### T5 — User-SGPR compatibility table + G3
 

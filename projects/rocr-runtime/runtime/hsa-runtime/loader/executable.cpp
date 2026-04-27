@@ -1621,6 +1621,15 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
                   << ",\"elf_size\":" << elfSize
                   << ",\"lifted_count\":" << irResult.liftedCount
                   << ",\"total_count\":" << irResult.totalCount;
+            if (irResult.usesScratchPrivateSegment) {
+              proof << ",\"uses_scratch_private_segment\":true"
+                    << ",\"source_private_segment_fixed_size\":"
+                    << irResult.sourcePrivateSegmentFixedSize
+                    << ",\"target_private_segment_fixed_size\":"
+                    << irResult.targetPrivateSegmentFixedSize
+                    << ",\"target_enable_private_segment\":"
+                    << (irResult.targetEnablePrivateSegment ? "true" : "false");
+            }
             if (irResult.c5SuppressedCount > 0) {
               proof << ",\"c5_suppressed_count\":"
                     << irResult.c5SuppressedCount
