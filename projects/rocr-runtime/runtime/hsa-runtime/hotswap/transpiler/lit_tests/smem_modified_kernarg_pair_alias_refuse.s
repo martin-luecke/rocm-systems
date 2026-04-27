@@ -3,27 +3,22 @@
 ; RUN:     --emit-ir=smem_modified_kernarg_pair_alias_refuse_kernel 2>&1 \
 ; RUN:   | %FileCheck %s
 ;
-; Negative companion to `smem_modified_kernarg_pair_base.s`.
-; Copying the entry kernarg pair to another SGPR pair preserves
-; Kernarg-derived provenance on the alias, so a later full overwrite of
-; s[0:1] from that alias must mark s[0:1] as Unknown rather than
-; NonKernarg (the alias is not an "independent non-kernarg source").
-; The downstream SMEM load through s[0:1] therefore lifts via
-; `addrspace(1)` rather than the kernarg-derived `addrspace(4)`
-; cast — the lift no longer refuses, it just declines the SMEM hint.
+; Companion to `smem_modified_kernarg_pair_base.s` covering the
+; alias-then-overwrite shape: s[12:13] is copied from the entry
+; kernarg pair, then s[0:1] is overwritten via that alias. The lift
+; produces an `addrspace(1)` SMEM load through s[0:1]; the AMDGPU
+; backend's lowering picks SMEM vs VMEM from load uniformity at
+; codegen time without needing a lift-side addrspace hint.
 
 ; CHECK-LABEL: define amdgpu_kernel void @smem_modified_kernarg_pair_alias_refuse_kernel(
 ; CHECK-SAME: [4 x i8] %kargs
 
-; The entry kernarg pair is seeded from `amdgcn_kernarg_segment_ptr`.
+; The entry kernarg pair is seeded from `amdgcn_kernarg_segment_ptr`
+; (which always returns `ptr addrspace(4)`).
 ; CHECK: call ptr addrspace(4) @llvm.amdgcn.kernarg.segment.ptr()
 
-; The post-overwrite SMEM load lands on `addrspace(1)`, not
-; `addrspace(4)`. Routing it through the kernarg cast would let the
-; AMDGPU backend assume invariance against the (mutated) base, which
-; is exactly what the alias-then-overwrite shape invalidates.
+; The post-overwrite SMEM load lands on `addrspace(1)`.
 ; CHECK: %smem_load = load i32, ptr addrspace(1) %{{[^,]+}}, align 4
-; CHECK-NOT: %smem_load = load i32, ptr addrspace(4)
 
 	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
 	.amdhsa_code_object_version 6

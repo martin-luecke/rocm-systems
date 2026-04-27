@@ -15,9 +15,12 @@
 ;
 ;   2. The `s_load_b96 s[0:2], s[0:1], 0x4` reaches the three kernarg
 ;      dwords at offsets 4/8/12 via three real `load i32` ops against
-;      a `ptr addrspace(4)` cast of `amdgcn_kernarg_segment_ptr`, and
+;      a `ptr addrspace(1)` cast of `amdgcn_kernarg_segment_ptr`, and
 ;      the results flow into the per-VGPR phi-under-EXEC shape
-;      (proves the lift didn't refuse and stub the kernel body).
+;      (proves the lift didn't refuse and stub the kernel body). The
+;      AMDGPU backend re-derives the SMEM/VMEM choice from the load
+;      uniformity at lowering time; the lift no longer hand-picks
+;      `addrspace(4)` to nudge it.
 ;
 ; The phi RHS basic-block names and intermediate SSA names are LLVM-
 ; printer-renumbered, so we use `{{[a-zA-Z_0-9]+}}` placeholders.
@@ -28,9 +31,9 @@
 ; CHECK-SAME: [24 x i8] %kargs
 
 ; Kernarg fetches go through `llvm.amdgcn.kernarg.segment.ptr` + a
-; real load on `ptr addrspace(4)`.
+; real load on `ptr addrspace(1)`.
 ; CHECK: call ptr addrspace(4) @llvm.amdgcn.kernarg.segment.ptr()
-; CHECK: load i32, ptr addrspace(4) %{{[^,]+}}, align 4
+; CHECK: load i32, ptr addrspace(1) %{{[^,]+}}, align 4
 
 ; The s_load_b96 result must reach the per-VGPR phi-under-EXEC shape
 ; via real kernarg loads (proves the lift didn't refuse and stub the

@@ -17,19 +17,14 @@ namespace {
 // Look up the SGPR index that holds the *low* dword of the source-ISA
 // KernargSegmentPtr at kernel entry, via `ctx.userSgprLayout`.
 //
-// Why this exists: both the dword-granular S_LOAD_B* block and the
-// narrow-SMEM (S_LOAD_U8/I8/U16/I16) block need to answer the same
-// question — "is this load's sbase the kernarg pointer?" — to decide
-// between the addrspace(4) (kernarg) cast and the addrspace(1)
-// (global) cast. The previous implementation hardcoded
-// `baseIdx == 0`, which is only correct when KernargSegmentPtr is
-// the first enabled user-SGPR source. That held for Triton kernels
-// (where it is the only enabled source) but silently broke as soon
-// as a kernel also enabled PrivateSegmentBuffer (4 dwords),
-// DispatchPtr (2 dwords), or QueuePtr (2 dwords) ahead of it in the
-// canonical enable_sgpr_* order — the kernarg pointer then slides up
-// to s[2:3], s[6:7], s[8:9], etc., and every `baseIdx == 0` check
-// incorrectly rejects it.
+// Used by the dword-granular S_LOAD_B* block and the narrow-SMEM
+// (S_LOAD_U8/I8/U16/I16) block to gate the implicit-args reroute on
+// "is this load's sbase the kernarg pair?" The previous implementation
+// hardcoded `baseIdx == 0`, which broke as soon as a kernel enabled
+// PrivateSegmentBuffer (4 dwords), DispatchPtr (2 dwords), or QueuePtr
+// (2 dwords) ahead of the kernarg pointer in the canonical
+// enable_sgpr_* order — the kernarg pair then slides up to s[2:3],
+// s[6:7], s[8:9], etc.
 //
 // The layout object is the single source of truth for the source
 // ISA's user-SGPR ABI. It is populated by
@@ -51,18 +46,6 @@ int getKernargPtrSgpr(RaiseContext &ctx) {
         "The raiser must populate this before dispatching to handlers; "
         "missing wiring is a bug.");
   return ctx.userSgprLayout->kernargSegmentPtrSgpr;
-}
-
-// Per-dword provenance lookup for the source-ABI kernarg-pair low SGPR.
-// Returns the default `Unknown` slot when no kernarg pointer is enabled
-// or the index falls outside the tracked range, so the callers can
-// uniformly compare `kind` without a separate range guard.
-RaiseContext::SgprKernargProvenance
-kernargPairProvenance(RaiseContext &ctx, int kernargPtrSgpr) {
-  if (kernargPtrSgpr < 0 ||
-      static_cast<size_t>(kernargPtrSgpr) >= ctx.sgprKernargProvenance.size())
-    return {};
-  return ctx.sgprKernargProvenance[kernargPtrSgpr];
 }
 
 } // namespace
@@ -110,10 +93,6 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
     bool baseIsKernargPair =
         (base.kind == ParsedReg::SGPR && kernargPtrSgpr >= 0 &&
          base.baseIdx == kernargPtrSgpr);
-    bool isKernarg =
-        baseIsKernargPair &&
-        kernargPairProvenance(ctx, kernargPtrSgpr).kind ==
-            RaiseContext::SgprKernargProvenance::Kind::Kernarg;
 
     // Implicit-args reroute. AMDGPU separates the explicit kernarg
     // segment from the implicit-arg block: the latter is reachable via
@@ -132,11 +111,16 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
     // ROCm convention that the layouts match (both gfx9-12 follow
     // the same `hidden_*` block).
     //
-    // Required guards: `isKernarg` + `immOffset` + a positive
-    // `implicitArgsBase`. Without those, the offset doesn't denote
-    // an implicit-arg slot and we fall through to the generic
-    // kernarg/global path.
-    if (isKernarg && immOffset && ctx.kernargs.implicitArgsBase > 0 &&
+    // Gating: `baseIsKernargPair` (literal SGPR-index match against
+    // the source-ABI kernarg pair) + `immOffset` + a positive
+    // `implicitArgsBase`. We deliberately do NOT track whether the
+    // pair has been mutated since entry: corpus shapes that overwrite
+    // the pair (Triton/SGLang `s[0:1] = preloaded_ptr + wg_offset`,
+    // Tensile UniversalArgs `+16` shift) only issue follow-up loads at
+    // small offsets that fall well below `implicitArgsBase`, so the
+    // gate is precise enough in practice.
+    if (baseIsKernargPair && immOffset &&
+        ctx.kernargs.implicitArgsBase > 0 &&
         byteOffset >= ctx.kernargs.implicitArgsBase) {
       if (isStrictMode()) {
         hr.failure = RaiseFailure::strictUnsafeLowering(
@@ -168,27 +152,19 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
       return hr;
     }
 
-    // The kernarg SGPR pair is seeded with `ptrtoint(amdgcn_kernarg_segment_ptr)`
-    // in `raiser.cpp` Phase 4, so the generic GEP+load path serves every
-    // kernarg-derived SMEM load uniformly: immediate offsets, SGPR offsets,
-    // tracked const deltas (`s_add_u32`/`s_addc_u32`), runtime arithmetic
-    // (`s_lshl2_add_u32`, `s_add_co_u32 sN, sN, sM`), and full pair
-    // overwrites (Triton/SGLang `s[0:1] = preloaded_ptr + wg_offset`,
-    // Tensile HBMArgs `s_load_b64 s[0:1], s[0:1], 0x10`) all flow through
-    // `loadSGPR64` correctly.
-    //
-    // The per-dword `RaiseContext::sgprKernargProvenance` map is read
-    // here purely as an addrspace hint: when the pair is still derived
-    // from the entry kernarg pointer (unmodified or shifted by a
-    // tracked constant delta), pick `addrspace(4)` so the backend
-    // selects SMEM (`s_load_*`); otherwise fall through to
-    // `addrspace(1)` (global) so the backend can lower to VMEM or, for
-    // uniform bases, late-promote back to SMEM.
+    // Generic GEP+load against `addrspace(1)`. The AMDGPU backend
+    // re-derives uniformity / addrspace-narrowing during lowering: a
+    // load whose pointer is provably from `amdgcn_kernarg_segment_ptr`
+    // is selected as `s_load_*` against the kernarg segment regardless
+    // of the IR-level addrspace cast; for runtime-mutated bases (Triton/
+    // SGLang `s[0:1] = preloaded_ptr + wg_offset`, Tensile HBMArgs
+    // `s_load_b64 s[0:1], s[0:1], 0x10`, etc.) the backend keeps the
+    // VMEM lowering. The lift no longer hand-picks the addrspace —
+    // tracking pointer provenance at lift time was redundant with the
+    // backend's own analysis.
     {
-      llvm::Type *ptrTy = isKernarg ? llvm::PointerType::get(ctx.C, 4)
-                                    : ctx.ptrGlobalTy;
       Value *baseAddr = ctx.regs.loadSGPR64(ctx.B, base.baseIdx);
-      Value *ptr = ctx.B.CreateIntToPtr(baseAddr, ptrTy);
+      Value *ptr = ctx.B.CreateIntToPtr(baseAddr, ctx.ptrGlobalTy);
       if (immOffset) {
         if (byteOffset != 0)
           ptr = ctx.B.CreateInBoundsGEP(ctx.i8Ty, ptr, ctx.B.getInt64(byteOffset));
@@ -229,7 +205,7 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
   // offset), so operand decoding mirrors the S_LOAD_B* block above.
   //
   // Design notes:
-  //  * IR shape: `load iN, ptr addrspace(4|1) %p, align N` + `zext`/`sext`
+  //  * IR shape: `load iN, ptr addrspace(1) %p, align N` + `zext`/`sext`
   //    to i32 → `storeSGPR32`. No AMDGPU-specific intrinsic exists for
   //    narrow scalar loads; the backend's ISel matches the uniform-address
   //    pattern directly.
@@ -242,16 +218,6 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
   //    but the register class shifts SGPR→VGPR and the memory path
   //    shifts scalar-cache→vector-cache.
   //  * Alignment: explicit `Align(1)` for byte, `Align(2)` for halfword.
-  //  * Kernarg-pair sbase: same addrspace-hint policy as the wide
-  //    S_LOAD_B* path above. Kernarg-derived sbase → `addrspace(4)` so
-  //    the backend selects an SMEM narrow load against the kernarg
-  //    segment (`s_load_u8/u16` on gfx12+, VMEM cross-target);
-  //    otherwise → `addrspace(1)`. The narrow case used to refuse here
-  //    because the old slot-table extraction couldn't synthesise
-  //    sub-dword reads from typed IR Function args; with the kernarg
-  //    ABI lowering offloaded to LLVM, no extraction is needed and
-  //    Mluecke's narrow-by-value Triton kernels (e.g. matmul_ogs_dot
-  //    with packed scalar params) lift uniformly.
   //
   // Test back-reference: lit_tests/s_load_u16/ exercises the halfword
   // same-target happy path. The byte (u8/i8) and signed (i8/i16)
@@ -271,18 +237,8 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
     ParsedReg dest = op.dst();
     ParsedReg base = op.srcReg(0);
 
-    int kernargPtrSgpr = getKernargPtrSgpr(ctx);
-    bool baseIsKernargPair =
-        (base.kind == ParsedReg::SGPR && kernargPtrSgpr >= 0 &&
-         base.baseIdx == kernargPtrSgpr);
-    bool isKernarg =
-        baseIsKernargPair &&
-        kernargPairProvenance(ctx, kernargPtrSgpr).kind ==
-            RaiseContext::SgprKernargProvenance::Kind::Kernarg;
-    llvm::Type *ptrTy = isKernarg ? llvm::PointerType::get(ctx.C, 4)
-                                  : ctx.ptrGlobalTy;
     Value *baseAddr = ctx.regs.loadSGPR64(ctx.B, base.baseIdx);
-    Value *ptr = ctx.B.CreateIntToPtr(baseAddr, ptrTy);
+    Value *ptr = ctx.B.CreateIntToPtr(baseAddr, ctx.ptrGlobalTy);
     unsigned offIdx = op.srcIdx(1);
     if (di.isImm(offIdx)) {
       int64_t off = op.srcImm(1);

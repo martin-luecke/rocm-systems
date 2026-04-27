@@ -26,9 +26,11 @@
 ; CHECK-SAME: [24 x i8] %kargs
 
 ; Kernarg fetches go through `llvm.amdgcn.kernarg.segment.ptr` + a
-; real load on `ptr addrspace(4)`.
+; real load on `ptr addrspace(1)`. The AMDGPU backend re-derives the
+; SMEM/VMEM choice from load uniformity at lowering time; the lift no
+; longer hand-picks `addrspace(4)` to nudge it.
 ; CHECK: call ptr addrspace(4) @llvm.amdgcn.kernarg.segment.ptr()
-; CHECK: load i32, ptr addrspace(4) %{{[^,]+}}, align 4
+; CHECK: load i32, ptr addrspace(1) %{{[^,]+}}, align 4
 
 ; The +16 const delta must reach the post-mutation load chain: the
 ; lifted `s_add_u32 s0, s0, 0x10` shows up as `add i32 %, 16`, and
