@@ -20,18 +20,15 @@
 ; The phi RHS basic-block names and intermediate SSA names are LLVM-
 ; printer-renumbered, so we use `{{[a-zA-Z_0-9]+}}` placeholders.
 
-; The kernel signature must decompose to four i32 slots followed by
-; the global_buffer ptr.
+; The kernel signature is a single byte-array placeholder of the
+; source's kernarg_segment_size (16-byte by_value + 8-byte ptr = 24).
 ; CHECK-LABEL: define amdgpu_kernel void @smem_kernarg_const_delta_kernel(
-; CHECK-SAME: i32 %arg0
-; CHECK-SAME: i32 %arg1
-; CHECK-SAME: i32 %arg2
-; CHECK-SAME: i32 %arg3
-; CHECK-SAME: ptr addrspace(1) %arg4
+; CHECK-SAME: [24 x i8] %kargs
 
 ; Kernarg fetches go through `llvm.amdgcn.kernarg.segment.ptr` + a
-; real load.
+; real load on `ptr addrspace(4)`.
 ; CHECK: call ptr addrspace(4) @llvm.amdgcn.kernarg.segment.ptr()
+; CHECK: load i32, ptr addrspace(4) %{{[^,]+}}, align 4
 
 ; The +16 const delta must reach the post-mutation load chain: the
 ; lifted `s_add_u32 s0, s0, 0x10` shows up as `add i32 %, 16`, and
@@ -41,12 +38,6 @@
 ; CHECK: add i32 %{{[^ ,]+}}, 16
 ; CHECK-DAG: phi i32 [ %smem_load{{[0-9]*}}, %{{[a-zA-Z_0-9]+}}
 ; CHECK-DAG: phi i32 [ %smem_load{{[0-9]*}}, %{{[a-zA-Z_0-9]+}}
-
-; The pre-fix failure routed s2/s3 from kernarg byte 0 (= %arg0)
-; and byte 4 (= %arg1) instead of byte 16 (= %arg4).  Keep these as
-; a regression guard against any revert to the inlined-arg fast path.
-; CHECK-NOT: phi i32 [ %arg0, %{{[a-zA-Z_0-9]+}}
-; CHECK-NOT: phi i32 [ %arg1, %{{[a-zA-Z_0-9]+}}
 
 ; A zero/undef substitution on the active arm of the load-result
 ; phis would indicate the kernarg path silently swallowed a miss.

@@ -17,13 +17,15 @@
 ; `addrspace(1)` rather than as a kernarg cast against `addrspace(4)`.
 
 ; CHECK-LABEL: define amdgpu_kernel void @smem_modified_kernarg_pair_base_kernel(
-; CHECK-SAME: ptr addrspace(1) %arg0
-; CHECK-SAME: ptr addrspace(1) %arg1
+; CHECK-SAME: [16 x i8] %kargs
 
-; The preloaded input pointer is materialised from %arg0, then the modified
-; s[0:1] base is used by the ordinary SMEM path. A regression to the kernarg
-; extractor path would not emit these `smem_load` memory operations.
-; CHECK: ptrtoint ptr addrspace(1) %arg0 to i64
+; The preloaded input pointer is materialised via
+; `amdgcn_kernarg_segment_ptr` + load (addrspace(4) cast), then the
+; modified s[0:1] base is used by the ordinary SMEM path against
+; `addrspace(1)`. A regression that left the addrspace(4) cast on the
+; modified base would surface as `addrspace(4)` on the smem_load
+; lines below.
+; CHECK: call ptr addrspace(4) @llvm.amdgcn.kernarg.segment.ptr()
 ; CHECK: %smem_load = load i32, ptr addrspace(1) %{{[^,]+}}, align 4
 ; CHECK: %smem_load{{[0-9]*}} = load i32, ptr addrspace(1) %{{[^,]+}}, align 4
 ; CHECK: %smem_load{{[0-9]*}} = load i32, ptr addrspace(1) %{{[^,]+}}, align 4

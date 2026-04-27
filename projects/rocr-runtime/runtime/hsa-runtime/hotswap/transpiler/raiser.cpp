@@ -1065,93 +1065,46 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
   auto *f32Ty = Type::getFloatTy(C);
   auto *ptrGlobalTy = PointerType::get(C, 1);
 
-  // Build function signature dynamically from kernel metadata.
-  //
-  // The IR-level argument list serves a single purpose: it makes the
-  // AMDGPU backend emit a `kernarg_segment_size` and
-  // `kernarg_segment_alignment` in the lifted kernel's KD that match
-  // the source kernel's runtime kernarg buffer. The handlers do NOT
-  // read these arguments — kernarg loads lift to GEP+load against
-  // `amdgcn_kernarg_segment_ptr` and let the backend re-select
-  // `s_load_*` against the kernarg segment. So as long as we emit
-  // types whose cumulative byte layout matches the source ABI, the
+  // Build function signature: a single opaque `[N x i8]` placeholder
+  // whose only job is to make the AMDGPU backend emit
+  // `kernarg_segment_size = N` in the lifted kernel's KD so the
   // runtime's kernarg buffer reaches the kernel intact.
   //
-  // Slot shapes emitted:
-  //   * `global_buffer` (size==8) → ptr addrspace(1).
-  //   * non-pointer `by_value` size==1/2 → i8/i16.
-  //   * non-pointer `by_value` size==4 → i32.
-  //   * non-pointer `by_value` size==8 → i64.
-  //   * non-pointer `by_value` size > 8 (and divisible by 4, i.e. an
-  //     aggregate kernarg like Triton's tensor-descriptor struct) is
-  //     DECOMPOSED into one i32 slot per dword. Without this split the
-  //     IR would carry a single i32 placeholder for the whole struct
-  //     and codegen would only allocate 4 bytes for it — silently
-  //     shifting every downstream arg's runtime byte offset and turning
-  //     all kernarg loads past the struct into reads of garbage. Other
-  //     odd sizes are refused loudly: they would shift every
-  //     subsequent arg's offset against the source ABI and the
-  //     no-fallback rule applies.
+  // The handlers do NOT read this argument — kernarg loads lift to
+  // GEP+load against `amdgcn_kernarg_segment_ptr` and let the AMDGPU
+  // backend re-select `s_load_*` against the kernarg segment. The
+  // typed source-ABI signature (ptr addrspace(1) / i32 / i64 / per-
+  // dword aggregate split, plus Mluecke's i8/i16 narrow-by-value
+  // arms) is therefore unnecessary on the lifted side; a single
+  // byte-array argument of the right total size produces the same
+  // kernarg buffer layout from the runtime's point of view.
   //
-  // Test back-reference: lit_tests/s_load_b96_kernarg/ pins the i32
-  // slot signature this branch produces for a 16-byte by_value
-  // aggregate; any change to the dword-decomposition logic must keep
-  // that fixture's `(i32 %arg0, i32 %arg1, i32 %arg2, i32 %arg3, ptr
-  // addrspace(1) %arg4)` signature green.
-  SmallVector<Type *, 8> paramTypes;
+  // Notes:
+  //  * Alignment: `[N x i8]` has ABI alignment 1, so the lifted KD
+  //    reports `kernarg_segment_alignment = 1`. Hosts allocate
+  //    kernarg buffers via the standard runtime allocator (16-byte
+  //    aligned in practice) and AMDGPU SMEM tolerates 4-byte-aligned
+  //    access on lower-alignment buffers, so this is benign on every
+  //    target the corpus exercises. If a future target rejects 1-byte
+  //    declared alignment, switch to `[ceil(N/4) x i32]` (alignment
+  //    4) at the cost of rounding `kernarg_segment_size` up to a
+  //    multiple of 4.
+  //  * AMDGPULowerKernelArguments skips load emission for arguments
+  //    that are `use_empty()` but still bumps the cumulative arg
+  //    offset, so the unused placeholder still contributes to
+  //    `kernarg_segment_size`.
+  //
+  // Test back-reference: every lit fixture under `lit_tests/` pins
+  // either a `ptr addrspace(4)` GEP shape or an addrspace(1) global
+  // GEP shape against the segment_ptr intrinsic — none of them rely
+  // on a typed Function argument list anymore.
+  SmallVector<Type *, 1> paramTypes;
   KernargLayout kernargs;
   int paramIdx = 0;
-  for (auto &arg : meta.args) {
-    if (arg.valueKind == "hidden_global_offset_x" ||
-        arg.valueKind == "hidden_global_offset_y" ||
-        arg.valueKind == "hidden_global_offset_z" ||
-        arg.valueKind.rfind("hidden_", 0) == 0)
-      continue;
-    bool isPtr = (arg.valueKind == "global_buffer");
-    if (isPtr) {
-      if (arg.size != 8)
-        report_fatal_error(
-            Twine("transpiler: kernel '") + kernelName + "' arg '" +
-            arg.name + "' is global_buffer but size=" +
-            Twine(arg.size) + " (expected 8)");
-      paramTypes.push_back(ptrGlobalTy);
-      paramIdx++;
-      continue;
-    }
-    if (arg.size == 1) {
-      paramTypes.push_back(Type::getInt8Ty(C));
-      paramIdx++;
-      continue;
-    }
-    if (arg.size == 2) {
-      paramTypes.push_back(Type::getInt16Ty(C));
-      paramIdx++;
-      continue;
-    }
-    if (arg.size == 4) {
-      paramTypes.push_back(i32Ty);
-      paramIdx++;
-      continue;
-    }
-    if (arg.size == 8) {
-      paramTypes.push_back(i64Ty);
-      paramIdx++;
-      continue;
-    }
-    if (arg.size > 0 && arg.size % 4 == 0) {
-      int nDwords = arg.size / 4;
-      for (int d = 0; d < nDwords; ++d) {
-        paramTypes.push_back(i32Ty);
-        paramIdx++;
-      }
-      continue;
-    }
-    report_fatal_error(
-        Twine("transpiler: kernel '") + kernelName + "' arg '" +
-        arg.name + "' has unsupported by_value size=" + Twine(arg.size) +
-        " (expected 1, 2, 4, 8, or a positive multiple of 4); odd-sized "
-        "aggregate args would shift every subsequent kernarg byte offset "
-        "and silent rounding is rejected by the no-fallback rule.");
+  if (meta.kernargSegmentSize > 0) {
+    paramTypes.push_back(
+        ArrayType::get(i8Ty, static_cast<uint64_t>(meta.kernargSegmentSize)));
+    paramIdx = 1;
   }
   kernargs.implicitArgsBase = meta.implicitArgsBase();
   kernargs.kernargSegmentSize = meta.kernargSegmentSize;
@@ -1206,11 +1159,11 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
     F->addFnAttr("amdgpu-lds-size", sizeStr + "," + sizeStr);
   }
 
-  for (int i = 0; i < paramIdx; i++)
-    F->getArg(i)->setName("arg" + std::to_string(i));
+  if (paramIdx > 0)
+    F->getArg(0)->setName("kargs");
 
-  errs() << "transpiler: Kernel '" << kernelName << "' has " << paramIdx
-         << " args (kernarg_segment_size=" << meta.kernargSegmentSize << ")\n";
+  errs() << "transpiler: Kernel '" << kernelName
+         << "' kernarg_segment_size=" << meta.kernargSegmentSize << "\n";
 
   Function *fnWorkgroupIdX =
       Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_workgroup_id_x);

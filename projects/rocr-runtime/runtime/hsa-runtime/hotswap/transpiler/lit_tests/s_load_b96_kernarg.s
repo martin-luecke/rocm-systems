@@ -4,32 +4,33 @@
 ; Lift test for `s_load_b96` over a kernarg buffer that contains a
 ; `by_value` aggregate larger than 8 bytes.  Pins:
 ;
-;   1. The 16-byte `by_value` Big16 struct is decomposed into four
-;      i32 IR arguments at byte offsets 0/4/8/12, followed by the
-;      `global_buffer` ptr at offset 16 — not a single i128 / [16 x i8]
-;      / aggregate type.  See the `byValueSize > 8 && % 4 == 0` branch
-;      in raiser.cpp's `paramTypes` build.
+;   1. The lifted kernel signature is a single opaque
+;      `[kernarg_segment_size x i8]` placeholder. The handlers no
+;      longer read typed Function arguments; kernarg fetches lift to
+;      GEP+load against `amdgcn_kernarg_segment_ptr` and the AMDGPU
+;      backend re-selects `s_load_*` against the kernarg segment. The
+;      total segment size (24 bytes here: 16-byte by_value Big16 +
+;      8-byte global_buffer ptr) is preserved in the lifted KD via
+;      the placeholder array's size.
 ;
 ;   2. The `s_load_b96 s[0:2], s[0:1], 0x4` reaches the three kernarg
-;      dwords at offsets 4/8/12 and the result flows into the per-VGPR
-;      phi-under-EXEC shape (proves the lift didn't refuse and stub
-;      the kernel body).
+;      dwords at offsets 4/8/12 via three real `load i32` ops against
+;      a `ptr addrspace(4)` cast of `amdgcn_kernarg_segment_ptr`, and
+;      the results flow into the per-VGPR phi-under-EXEC shape
+;      (proves the lift didn't refuse and stub the kernel body).
 ;
 ; The phi RHS basic-block names and intermediate SSA names are LLVM-
 ; printer-renumbered, so we use `{{[a-zA-Z_0-9]+}}` placeholders.
 
-; The kernel signature must decompose the 16-byte by_value into four
-; i32 slots followed by the global_buffer ptr.
+; The kernel signature is a single byte-array placeholder of the
+; source's kernarg_segment_size (16-byte by_value + 8-byte ptr = 24).
 ; CHECK-LABEL: define amdgpu_kernel void @s_load_b96_kernarg_kernel(
-; CHECK-SAME: i32 %arg0
-; CHECK-SAME: i32 %arg1
-; CHECK-SAME: i32 %arg2
-; CHECK-SAME: i32 %arg3
-; CHECK-SAME: ptr addrspace(1) %arg4
+; CHECK-SAME: [24 x i8] %kargs
 
 ; Kernarg fetches go through `llvm.amdgcn.kernarg.segment.ptr` + a
-; real load.
+; real load on `ptr addrspace(4)`.
 ; CHECK: call ptr addrspace(4) @llvm.amdgcn.kernarg.segment.ptr()
+; CHECK: load i32, ptr addrspace(4) %{{[^,]+}}, align 4
 
 ; The s_load_b96 result must reach the per-VGPR phi-under-EXEC shape
 ; via real kernarg loads (proves the lift didn't refuse and stub the
@@ -41,12 +42,6 @@
 ; inactive arm of the EXEC predicate.
 ; CHECK-NOT: phi i32 [ i32 0, %{{[a-zA-Z_0-9]+}} ]
 ; CHECK-NOT: phi i32 [ i32 undef, %{{[a-zA-Z_0-9]+}} ]
-
-; The by_value decomposition must NOT collapse back into a single
-; argument of any of these non-decomposed shapes.
-; CHECK-NOT: define amdgpu_kernel void @s_load_b96_kernarg_kernel(i32 %arg0, ptr addrspace(1) %arg1)
-; CHECK-NOT: define amdgpu_kernel void @s_load_b96_kernarg_kernel({{[^,]+\[16 x i8\]}}
-; CHECK-NOT: define amdgpu_kernel void @s_load_b96_kernarg_kernel(i128
 
 	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
 	.amdhsa_code_object_version 6

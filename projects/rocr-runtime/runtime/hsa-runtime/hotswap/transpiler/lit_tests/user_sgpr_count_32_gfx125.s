@@ -11,8 +11,7 @@
 
 ; CHECK-NOT: user-sgpr-layout-mismatch
 ; CHECK-LABEL: define amdgpu_kernel void @user_sgpr_count_32_gfx125_kernel(
-; CHECK-SAME: i32 %arg0
-; CHECK-SAME: i32 %arg29
+; CHECK-SAME: [120 x i8] %kargs
 
 	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
 	.amdhsa_code_object_version 6
