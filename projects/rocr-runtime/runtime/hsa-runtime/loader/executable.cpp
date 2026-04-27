@@ -57,6 +57,7 @@
 #include <sstream>
 #include <atomic>
 #include <fstream>
+#include <utility>
 #include "inc/amd_hsa_elf.h"
 #include "inc/amd_hsa_kernel_code.h"
 #include "core/inc/amd_hsa_code.hpp"
@@ -72,7 +73,9 @@
 #include "hotswap/hotswap.hpp"
 #include "hotswap/transpiler.hpp"
 #ifdef ROCR_HOTSWAP_IR_RAISER
+#include "hotswap/transpiler/code_object_utils.hpp"
 #include "hotswap/transpiler/pipeline.hpp"
+#include "hotswap/transpiler/translation_cache.hpp"
 #endif
 #endif
 
@@ -214,6 +217,35 @@ static void AppendSalmonProofJson(const std::string& jsonFields) {
   if (!out) return;
   out << "{" << jsonFields << "}\n";
 }
+
+#ifdef ROCR_HOTSWAP_IR_RAISER
+static void AppendSalmonCacheProofJson(
+    transpiler::TranslationCacheStatus status, const std::string& sourceGfx,
+    const std::string& targetGfx, const std::string& key,
+    const std::string& metadataPath, const std::string& objectPath,
+    const std::string& reason, size_t kernelCount = 0,
+    const std::string& kernelName = "") {
+  std::ostringstream proof;
+  proof << "\"event\":\"salmon_cache\""
+        << ",\"status\":\""
+        << transpiler::translationCacheStatusString(status) << "\""
+        << ",\"source_gfx\":\"" << JsonEscape(sourceGfx) << "\""
+        << ",\"target_gfx\":\"" << JsonEscape(targetGfx) << "\"";
+  if (!key.empty())
+    proof << ",\"key\":\"" << JsonEscape(key) << "\"";
+  if (!metadataPath.empty())
+    proof << ",\"metadata\":\"" << JsonEscape(metadataPath) << "\"";
+  if (!objectPath.empty())
+    proof << ",\"cached_object\":\"" << JsonEscape(objectPath) << "\"";
+  if (!reason.empty())
+    proof << ",\"reason\":\"" << JsonEscape(reason) << "\"";
+  if (kernelCount > 0)
+    proof << ",\"kernel_count\":" << kernelCount;
+  if (!kernelName.empty())
+    proof << ",\"kernel_name\":\"" << JsonEscape(kernelName) << "\"";
+  AppendSalmonProofJson(proof.str());
+}
+#endif
 #endif
 
 Loader* Loader::Create(Context* context)
@@ -1361,6 +1393,7 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
   static const char* s_hotswap_isa_override = std::getenv("HSA_HOTSWAP_ISA_OVERRIDE");
   std::string hotswapTargetGfx;
   std::string hotswapOriginalIsa;  // original ISA from .note (may differ from patched e_flags)
+  int hotswapOriginalMach = -1;     // original MACH byte from Salmon EI_PAD when available
   std::cerr << "hotswap: LoadCodeObject ISA=" << codeIsa
             << " enabled=" << rocr::hotswap::IsEnabled()
             << " override=" << (s_hotswap_isa_override ? s_hotswap_isa_override : "null")
@@ -1388,6 +1421,7 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
       // the 'S','L' magic is unambiguous.
       if (elfSz >= 16 && elfBytes[9] == 'S' && elfBytes[10] == 'L') {
         uint8_t orig_mach = elfBytes[11];
+        hotswapOriginalMach = static_cast<int>(orig_mach);
         // MACH -> gfx name reverse table (mirrors LLVM's
         // EF_AMDGPU_MACH_AMDGCN_* in llvm/BinaryFormat/ELF.h).  Only
         // entries whose MACH byte is unambiguous on current AMDGPU HW
@@ -1549,6 +1583,83 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
           }
 
           const uint8_t* elfBytes = reinterpret_cast<const uint8_t*>(elfData);
+          std::vector<uint8_t> salmonSourceObject(elfBytes, elfBytes + elfSize);
+          const std::vector<std::string> salmonKernelNames =
+              transpiler::listKernelNames(salmonSourceObject);
+          const size_t salmonKernelCount = salmonKernelNames.size();
+          transpiler::TranslationCacheRequest cacheRequest;
+          cacheRequest.sourceObject =
+              ::llvm::ArrayRef<uint8_t>(salmonSourceObject);
+          cacheRequest.sourceGfx = srcGfx;
+          cacheRequest.targetGfx = tgtGfx;
+          cacheRequest.sourceIsa = sourceIsa;
+          cacheRequest.targetIsa = agentIsaName;
+          cacheRequest.codeIsa = codeIsa;
+          if (const char* rulesPath = std::getenv("HSA_HOTSWAP_RULES"))
+            cacheRequest.hotswapRulesPath = rulesPath;
+          cacheRequest.origMach = hotswapOriginalMach;
+          cacheRequest.enableWritelaneRewrite = true;
+          cacheRequest.enableWaveNative = true;
+          cacheRequest.strictMode = transpiler::isStrictMode();
+
+          bool salmonCacheHit = false;
+          const std::string cacheSkippedKernel =
+              transpiler::skippedKernelForTranslationCache(salmonKernelNames);
+          const bool salmonCacheBypassed = !cacheSkippedKernel.empty();
+          transpiler::TranslationCacheLookup cacheLookup;
+          if (salmonCacheBypassed) {
+            AppendSalmonCacheProofJson(
+                transpiler::TranslationCacheStatus::Disabled, srcGfx, tgtGfx,
+                "", "", "",
+                "kernel listed in HSA_SALMON_CACHE_SKIP_KERNELS",
+                salmonKernelCount, cacheSkippedKernel);
+            std::cerr << "salmon_cache: disabled for kernel '"
+                      << cacheSkippedKernel << "' (" << srcGfx << " -> "
+                      << tgtGfx << ")\n";
+          } else {
+            cacheLookup = transpiler::lookupTranslationCache(cacheRequest);
+          }
+          if (cacheLookup.status == transpiler::TranslationCacheStatus::Hit) {
+            AppendSalmonCacheProofJson(
+                cacheLookup.status, srcGfx, tgtGfx, cacheLookup.key,
+                cacheLookup.metadataPath, cacheLookup.objectPath,
+                cacheLookup.reason, salmonKernelCount);
+            std::cerr << "salmon_cache: hit (" << srcGfx << " -> " << tgtGfx
+                      << ", key=" << cacheLookup.key << ")\n";
+          } else if (cacheLookup.status ==
+                     transpiler::TranslationCacheStatus::Miss) {
+            AppendSalmonCacheProofJson(
+                cacheLookup.status, srcGfx, tgtGfx, cacheLookup.key,
+                cacheLookup.metadataPath, cacheLookup.objectPath,
+                cacheLookup.reason, salmonKernelCount);
+            const char* cacheDebug = std::getenv("HSA_SALMON_CACHE_DEBUG");
+            if (cacheDebug && cacheDebug[0])
+              std::cerr << "salmon_cache: miss (" << cacheLookup.reason
+                        << ", key=" << cacheLookup.key << ")\n";
+          } else if (cacheLookup.status ==
+                     transpiler::TranslationCacheStatus::Invalid) {
+            AppendSalmonCacheProofJson(
+                cacheLookup.status, srcGfx, tgtGfx, cacheLookup.key,
+                cacheLookup.metadataPath, cacheLookup.objectPath,
+                cacheLookup.reason, salmonKernelCount);
+            std::cerr << "salmon_cache: INVALID (" << srcGfx << " -> "
+                      << tgtGfx << ", key=" << cacheLookup.key
+                      << "): " << cacheLookup.reason << "\n";
+            {
+              std::ostringstream proof;
+              proof << "\"event\":\"salmon_result\""
+                    << ",\"success\":false"
+                    << ",\"source_gfx\":\"" << JsonEscape(srcGfx) << "\""
+                    << ",\"target_gfx\":\"" << JsonEscape(tgtGfx) << "\""
+                    << ",\"elf_size\":" << elfSize
+                    << ",\"fail_reason\":\"cache_invalid\""
+                    << ",\"fail_detail\":\""
+                    << JsonEscape(cacheLookup.reason) << "\"";
+              AppendSalmonProofJson(proof.str());
+            }
+            return HSA_STATUS_ERROR;
+          }
+
           // Post-graduation default: WaveNative is on for wave32 →
           // wave64 cross-widening. See hotswap/docs/modrep-predicate-
           // chain.md §6 for the empirical evidence (swiglu_fp32
@@ -1559,8 +1670,14 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
           // removed so `--disable-wave-native` and
           // `enableWaveNative=false` are the single source of
           // truth for opting back into MODREP.
-          auto irResult = transpiler::runPipelineAllKernels(
-              {elfBytes, elfBytes + elfSize}, srcGfx, tgtGfx);
+          transpiler::PipelineResult irResult;
+          if (cacheLookup.status == transpiler::TranslationCacheStatus::Hit) {
+            salmonCacheHit = true;
+            irResult = std::move(cacheLookup.result);
+          } else {
+            irResult = transpiler::runPipelineAllKernels(
+                salmonSourceObject, srcGfx, tgtGfx);
+          }
 
           if (!irResult.success || irResult.hsaco.empty()) {
             std::cerr << "salmon: FAILED (" << srcGfx << " -> " << tgtGfx
@@ -1600,14 +1717,62 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
           }
 
           static std::vector<std::vector<uint8_t>> s_salmonBuffers;
-          s_salmonBuffers.push_back(std::move(irResult.hsaco));
+          s_salmonBuffers.push_back(irResult.hsaco);
           elfData = const_cast<void*>(
               static_cast<const void*>(s_salmonBuffers.back().data()));
           elfSize = s_salmonBuffers.back().size();
           code = std::make_unique<code::AmdHsaCode>();
           if (!code->InitAsBuffer(elfData, elfSize)) {
             std::cerr << "salmon: failed to re-init code object\n";
+            if (salmonCacheHit) {
+              AppendSalmonCacheProofJson(
+                  transpiler::TranslationCacheStatus::Invalid, srcGfx, tgtGfx,
+                  cacheLookup.key, cacheLookup.metadataPath,
+                  cacheLookup.objectPath,
+                  "cached object failed ROCR code object initialization",
+                  salmonKernelCount);
+            }
+            {
+              std::ostringstream proof;
+              proof << "\"event\":\"salmon_result\""
+                    << ",\"success\":false"
+                    << ",\"source_gfx\":\"" << JsonEscape(srcGfx) << "\""
+                    << ",\"target_gfx\":\"" << JsonEscape(tgtGfx) << "\""
+                    << ",\"elf_size\":" << elfSize
+                    << ",\"lifted_count\":" << irResult.liftedCount
+                    << ",\"total_count\":" << irResult.totalCount
+                    << ",\"fail_reason\":\"init_as_buffer_failed\""
+                    << ",\"fail_detail\":\"translated HSACO failed ROCR "
+                       "code object initialization\""
+                    << ",\"cache_hit\":"
+                    << (salmonCacheHit ? "true" : "false");
+              AppendSalmonProofJson(proof.str());
+            }
             return HSA_STATUS_ERROR;
+          }
+          if (!salmonCacheHit && !salmonCacheBypassed) {
+            auto cacheWrite =
+                transpiler::writeTranslationCache(cacheRequest, irResult);
+            if (cacheWrite.status ==
+                transpiler::TranslationCacheStatus::WriteSuccess) {
+              AppendSalmonCacheProofJson(
+                  cacheWrite.status, srcGfx, tgtGfx, cacheWrite.key,
+                  cacheWrite.metadataPath, cacheWrite.objectPath,
+                  cacheWrite.reason, salmonKernelCount);
+              const char* cacheDebug = std::getenv("HSA_SALMON_CACHE_DEBUG");
+              if (cacheDebug && cacheDebug[0])
+                std::cerr << "salmon_cache: write_success (key="
+                          << cacheWrite.key << ")\n";
+            } else if (cacheWrite.status ==
+                       transpiler::TranslationCacheStatus::WriteFailed) {
+              AppendSalmonCacheProofJson(
+                  cacheWrite.status, srcGfx, tgtGfx, cacheWrite.key,
+                  cacheWrite.metadataPath, cacheWrite.objectPath,
+                  cacheWrite.reason, salmonKernelCount);
+              std::cerr << "salmon_cache: write_failed (key="
+                        << cacheWrite.key << "): " << cacheWrite.reason
+                        << "\n";
+            }
           }
           std::cerr << "salmon: OK (" << srcGfx << " -> " << tgtGfx << ", "
                     << irResult.liftedCount << "/" << irResult.totalCount
@@ -1620,7 +1785,9 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
                   << ",\"target_gfx\":\"" << JsonEscape(tgtGfx) << "\""
                   << ",\"elf_size\":" << elfSize
                   << ",\"lifted_count\":" << irResult.liftedCount
-                  << ",\"total_count\":" << irResult.totalCount;
+                  << ",\"total_count\":" << irResult.totalCount
+                  << ",\"cache_hit\":"
+                  << (salmonCacheHit ? "true" : "false");
             if (irResult.usesScratchPrivateSegment) {
               proof << ",\"uses_scratch_private_segment\":true"
                     << ",\"source_private_segment_fixed_size\":"
