@@ -1621,6 +1621,12 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
                   << ",\"elf_size\":" << elfSize
                   << ",\"lifted_count\":" << irResult.liftedCount
                   << ",\"total_count\":" << irResult.totalCount;
+            if (irResult.c5SuppressedCount > 0) {
+              proof << ",\"c5_suppressed_count\":"
+                    << irResult.c5SuppressedCount
+                    << ",\"c5_suppression_reason\":\""
+                    << JsonEscape(irResult.c5SuppressionReason) << "\"";
+            }
             AppendSalmonProofJson(proof.str());
           }
         } else

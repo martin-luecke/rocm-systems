@@ -1,18 +1,21 @@
 # MODREP predicate-chain class
 
-**Status.** Option O1 (loud-refuse classifier) landed; O2 (mask
-rewrite) deferred indefinitely on semantic grounds; O3 is now active only as
-the analysis-selected ThreadLoop retry for the §5.6.3 explicit-readfirstlane
-SGPR-forced class. Under `WaveNativeProjection` (the default for wave32 →
-wave64 cross-widening) the class is structurally suppressed except for the
-phantom-lane sub-case.
-Under `ModuloReplicationProjection` (opt-in via `--disable-wave-native` /
-`enableWaveNative=false`) the class is loud-refused by the narrow-O1
-classifier in `transpiler/c5_predicate_chain_classifier.{hpp,cpp}`.
+**Status.** Option O1 (projection-aware loud-refuse classifier) landed; O2
+(mask rewrite) deferred indefinitely on semantic grounds; O3 is now active
+only as the analysis-selected ThreadLoop retry for the §5.6.3
+explicit-readfirstlane SGPR-forced class. Under `WaveNativeProjection` (the
+default for wave32 → wave64 cross-widening) the class is structurally
+suppressed except for the defensive phantom-lane sub-case. Under
+`ModuloReplicationProjection`, the narrow-O1 classifier in
+`transpiler/c5_predicate_chain_classifier.{hpp,cpp}` refuses only when an
+active target replica lane can exist; statically single-source-wave launches
+(`0 < max_flat_workgroup_size ≤ W_s`) remain supported because upper target
+lanes are hardware-inactive for the entire kernel body.
 
 **Boundary with the §5.6.3 cross-lane safety-net.** This document's
 C5 predicate-chain refusal is projection-dependent (suppressed under
-WaveNative except the phantom-lane sub-case, active under MODREP).
+WaveNative except the defensive phantom-lane sub-case, active under MODREP
+only when launch metadata does not prove the no-active-replica regime).
 That is distinct from the post-raise
 `rewriteCrossLaneDivergent` use-chain safety-net in
 `rewrite_cross_lane_divergent.{hpp,cpp}` (the
@@ -28,10 +31,10 @@ wave-size ratio. It is still analysis-driven and invisible to users. The
 retry lowers `readlane`, `writelane`, and explicit `readfirstlane` as
 source-wave-scoped operations and keeps the original loud refusal for shapes
 outside that proof. This is orthogonal to MODREP C5:
-`WorkitemIdPredicateChain` remains a refusal under MODREP and remains
-suppressed under WaveNative's non-phantom contract. The ThreadLoop retry
-suppresses the C5 refusal only on this narrowed route; it is not a general
-"ThreadLoop solves C5" claim.
+`WorkitemIdPredicateChain` remains a refusal under MODREP whenever active
+replica lanes can exist and remains suppressed under WaveNative's
+non-phantom contract. The ThreadLoop retry suppresses the C5 refusal only on
+this narrowed route; it is not a general "ThreadLoop solves C5" claim.
 
 **Scope.** Wave-size axis: kernels compiled for a source wave
 width `W_s` that reach cross-widening (`W_t > W_s`) under
@@ -243,24 +246,24 @@ descriptor; it does not upscale to target-wave alignment):
 - **Sub-case 2: `blockDim.x = W_s` (single-warp kernel).** The
   target dispatches one wave64 wavefront with only the low
   `W_s` lanes in EXEC at entry. Active lanes' `tid ∈ [0, W_s)`
-  and kernel predicates evaluate correctly on the active subset.
-  The class does not manifest in the predicate-chain per se, but
-  convergent cross-lane primitives (`ds_bpermute`,
-  `update.dpp`, etc.) participate over the full physical wave
-  regardless of EXEC — their gathers can reach the inactive
-  upper-half lanes whose VGPR state doesn't match what the
-  source compile expected, and active-lane downstream computation
-  reads those values. This secondary effect is NOT the
-  predicate-chain class per (1)-(2)-(3) above; it is a related
-  but distinct mode covered in part by `WaveNativeProjection`'s
-  `init_whole_wave` default.
+  and kernel predicates evaluate correctly on the active subset;
+  no active target replica lane can disagree with its source-lane
+  counterpart. Salmon therefore routes this statically-known
+  phantom-lane launch to `ModuloReplicationProjection`, not
+  `WaveNativeProjection`: upper target lanes stay hardware-inactive
+  for the whole kernel, so their undefined VGPR state cannot
+  participate in VALU, memory, or cross-lane side effects. This is
+  the GPT-OSS/SGLang rotary-kernel shape (`max_flat_workgroup_size =
+  W_s = 32` on a wave64 target).
 
 ### 4.4 Class summary
 
 Every site exhibiting the class shares the three ingredients of
-§2 plus one of the two sub-cases in §4.3. The class is
-orthogonal to C1–C4: C1 is about `mbcnt_hi` / `ballot` leaks
-(already caught); this class is about `workitem.id.x()`.
+§2 plus active target lanes outside the source-wave lane domain
+(§4.3 sub-case 1, or unknown launch metadata that cannot rule it
+out). The class is orthogonal to C1–C4: C1 is about `mbcnt_hi` /
+`ballot` leaks (already caught); this class is about
+`workitem.id.x()`.
 
 The per-instruction cross-lane rewrites (P1–P6) are *necessary*
 for wave-size obliviousness but not *sufficient* — a kernel that
@@ -289,6 +292,17 @@ operand that is a compile-time constant K with
 with `K ≤ W_s − 1` mask the tid-divergence away and do not
 contribute to the unmasked set.
 
+**Projection / launch gate.** The shape becomes a refusal only when the
+selected projection can activate a target lane outside the source-wave lane
+domain. This relies on the HSACO contract that `max_flat_workgroup_size` is a
+hard launch upper bound for the kernel descriptor Salmon emits. MODREP
+refuses when `max_flat_workgroup_size == 0` (unknown) or
+`max_flat_workgroup_size > W_s`; it records a structured safe-C5 proof note
+but does not refuse when `0 < max_flat_workgroup_size ≤ W_s`. WaveNative
+suppresses the shape in the normal no-phantom regime and retains a defensive
+phantom-lane refusal for direct callers. ThreadLoop suppresses only for the
+separately-proven §5.6.3 retry route.
+
 **Coverage.** Catches the Kogge-Stone scan shape (stage guards
 `tid > 2^s − 1` with `s < log2(W_s)`). Does not catch kernels
 that use dynamic-operand bounds checks (`vecadd_f16` and
@@ -299,12 +313,11 @@ friends), which is the design intent.
 
 **Risk.** Sound-but-incomplete by construction: false positives
 (refusing a safe kernel whose predicate happens to match the
-narrow-O1 shape) are benign; false negatives (missing a
-wave-size-sensitive predicate whose operand is dynamic) leave a
-residual silent-miscompile class for dynamic-operand shapes,
-which §6 argues is covered empirically by the
-WaveNative-default suppression + end-to-end corpus regression
-testing.
+narrow-O1 shape and has possible active replica lanes) are benign;
+false negatives (missing a wave-size-sensitive predicate whose operand is
+dynamic) leave a residual silent-miscompile class for dynamic-operand
+shapes, which §6 argues is covered empirically by the WaveNative-default
+suppression + end-to-end corpus regression testing.
 
 ### O2. Predicate-chain rewrite
 
@@ -417,23 +430,28 @@ Two-pass walker:
 `W_t ≤ W_s` (same-wave / narrowing have no replica-1; the class
 cannot manifest).
 
-**Projection gate (`waveNative` parameter).** When invoked with
-`waveNative = true`, refusal is suppressed but the walk still
-runs and populates `observedSites` for debugging. Rationale:
-`WaveNativeProjection`'s `init_whole_wave` + per-source-lane
-modeled-EXEC model means each target lane's `tid` IS its own
-source-wave tid (for num_warps > 1, target wavefront 0's lanes
-0..31 run source wave 0 with tids 0..31, lanes 32..63 run
-source wave 1 with tids 32..63); the MODREP "replica-1 shares
-source wave 0's EXEC" assumption — the exact rationale the
-refusal exists for — does not apply.
+**Projection / launch gate.** The caller passes the selected projection, not
+the user-facing `enableWaveNative` flag. The walk still runs and populates
+`observedSites`; the projection/launch gate decides whether a site becomes a
+refusal or an attribution breadcrumb.
 
-The suppression is a projection-model statement, not a universal
-safety proof. If a launch configuration ever materialises with
-"phantom" target lanes outside the source's WG index space, the
-suppression is permissive — the classifier logs the observed
-sites via `LLVM_DEBUG` under the `wave-projection` debug
-category so regressions have an attribution trail.
+- `WaveNativeProjection`: refusal is suppressed in the normal no-phantom
+  regime. `init_whole_wave` + per-source-lane modeled EXEC means each target
+  lane's `tid` IS its own source-wave tid (for `num_warps > 1`, target
+  wavefront 0's lanes 0..31 run source wave 0 with tids 0..31, lanes 32..63
+  run source wave 1 with tids 32..63); the MODREP "replica-1 shares source
+  wave 0's EXEC" assumption does not apply. A defensive refusal remains if a
+  direct caller selects WaveNative with `0 < max_flat_workgroup_size < W_t`.
+- `ModuloReplicationProjection`: refusal fires only when active replica lanes
+  can exist (`max_flat_workgroup_size == 0` unknown, or
+  `max_flat_workgroup_size > W_s`). If `0 < max_flat_workgroup_size ≤ W_s`,
+  the HSACO launch-bound metadata proves upper target lanes are
+  hardware-inactive for the whole kernel and cannot observe the divergent
+  predicate. Successful Salmon proof JSON carries
+  `c5_suppressed_count` / `c5_suppression_reason` when this accepted-C5 path
+  is exercised.
+- `ThreadLoopProjection`: refusal is suppressed only for the existing
+  analysis-triggered SGPR-forced explicit-readfirstlane retry route.
 
 **Regression guards.** See §7.
 
@@ -467,7 +485,8 @@ The predicate-chain class the narrow-O1 classifier detects is
 MODREP-specific by construction — under WaveNative the replicas
 don't exist and each target lane's `tid` is its own source-wave
 `tid`. The classifier short-circuits the refusal under
-WaveNative by design (§6.1's `waveNative` gate).
+WaveNative by design (§6.1's projection gate), except for the
+defensive phantom-lane direct-caller guard.
 
 Rationale for the default choice:
 
@@ -494,7 +513,8 @@ MODREP code is fully retained:
    pin MODREP-shape IR invariants
    (`c5_predicate_chain_tid`, `v_cmp_cndmask_sgpr_scalar_clobber`)
    and for operators debugging projection-specific behaviour.
-3. The narrow-O1 classifier's refusal path runs under MODREP
+3. The narrow-O1 classifier's refusal path runs under MODREP when active
+   replica lanes can exist, short-circuits under single-source-wave MODREP,
    and short-circuits under WaveNative per §6.1.
 
 ### 6.4 Scope note: orthogonal fixes for canary / corpus_layernorm
@@ -530,8 +550,9 @@ end-to-end verdicts.
 
 The narrow-O1 classifier (§6.1) still serves as the MODREP-path
 regression guard for the predicate-chain class — on a future
-kernel that genuinely hits the class under MODREP, the
-classifier loud-refuses rather than silently miscompiling.
+kernel that genuinely hits the class under MODREP with possible active
+replica lanes, the classifier loud-refuses rather than silently
+miscompiling.
 
 ### 6.5 Deferred options — reopening criteria
 
@@ -566,20 +587,28 @@ O2 / O3 / O4 reopen if:
     `compile-time constant 16` detail string, and
     `Class 5 / WorkitemIdPredicateChain` per-site trace.
   - WaveNative default path: expects clean raise + IR
-    emission (the classifier's `waveNative` gate suppresses
+    emission (the classifier's projection gate suppresses
     refusal).
+- **`lit_tests/c5_predicate_chain_phantom_lane/`** — same C5 shape with
+  `max_flat_workgroup_size: 32` on a wave64 target. Expects the raiser to
+  select MODREP for phantom-lane safety and then accept the C5 site because
+  no active target replica lanes exist.
 - **`lit_tests/c5_predicate_chain_masked/`** — non-refusal
   sibling. Same K=16 icmp preceded by `and tid, 31` (= W_s−1);
   expects raise_cli success and the `and i32 ..., 31` anchor
   in the emitted IR.
 - **`tests/c5_predicate_chain_test.cpp`** — `C5PredicateChain.*`
-  gtest suite (13 cases). Audits the classifier on synthesised
+  gtest suite. Audits the classifier on synthesised
   IR in isolation from the MC-level pipeline:
   `TidDirectSmallConstRefuses`, `TidMaskedBeforeCmpAccepts`,
   `TidSmallConstZeroAccepts`, `TidLargeConstAccepts`,
   `TidDynamicCmpAccepts`, `SameWaveDirectionGate`,
   `NarrowingDirectionGate`, `WaveNativeProjectionGate`,
-  `NoCallsIsNoOp`, `PhiPropagatesTidDerivation`,
+  `ThreadLoopProjectionGate`, `WaveNativePhantomLaneRegimeRefuses`,
+  `WaveNativeUnknownWorkgroupSizeKeepsSuppression`,
+  `ModrepSingleSourceWaveAccepts`,
+  `ModrepUnknownOrActiveReplicaRefuses`, `NoCallsIsNoOp`,
+  `PhiPropagatesTidDerivation`,
   `MaskedPhiThroughUnmaskedArmRefuses`,
   `CrossSubtreeMaskedVsUnmaskedAccepts` (pins that the
   `icmp unmasked-tid, masked-tid` cross-subtree shape is NOT
