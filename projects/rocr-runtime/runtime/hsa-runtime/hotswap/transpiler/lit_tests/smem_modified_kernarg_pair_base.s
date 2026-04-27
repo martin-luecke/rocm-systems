@@ -13,8 +13,8 @@
 ;
 ; The base register number is still the source-ABI kernarg pair, but its
 ; value is no longer the entry kernarg segment pointer. The raiser must
-; lower the subsequent SMEM as normal scalar memory loads, not route them
-; through `extractKernargDword` and not refuse as an unknown kernarg delta.
+; lower the subsequent SMEM as normal scalar memory loads against
+; `addrspace(1)` rather than as a kernarg cast against `addrspace(4)`.
 
 ; CHECK-LABEL: define amdgpu_kernel void @smem_modified_kernarg_pair_base_kernel(
 ; CHECK-SAME: ptr addrspace(1) %arg0
