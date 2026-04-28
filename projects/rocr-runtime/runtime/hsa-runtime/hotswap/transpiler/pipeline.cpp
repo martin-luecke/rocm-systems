@@ -314,7 +314,7 @@ static bool raiseAndCompileKernel(const TextSection &text,
 static bool linkObjects(llvm::ArrayRef<std::string> objPaths,
                         llvm::StringRef hsacoPath) {
   std::string lldBin = std::string(LLVM_TOOLS_DIR) + "/ld.lld";
-  llvm::SmallVector<llvm::StringRef, 16> args;
+  llvm::SmallVector<llvm::StringRef> args;
   args.push_back(lldBin);
   args.push_back("-shared");
   args.push_back("-o");

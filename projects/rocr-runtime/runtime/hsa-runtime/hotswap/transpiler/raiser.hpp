@@ -7,9 +7,9 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
-#include <vector>
 
 namespace llvm {
 class LLVMContext;

@@ -429,7 +429,7 @@ struct BlockData {
   size_t firstIdx = 0;
   size_t lastIdx = 0;
   llvm::DenseMap<unsigned, PairTransfer> transfers;
-  SmallVector<uint64_t, 2> successors;
+  SmallVector<uint64_t> successors;
 };
 
 // A swap/set_pc site whose source pair was pristine through its block
@@ -470,7 +470,7 @@ struct PendingB {
 // facts mention the pair; it then OR's in incomplete from any
 // predecessor that DIDN'T mention the pair.
 struct PcLatticeValue {
-  llvm::SmallVector<uint64_t, 8> values;  // sorted, deduped
+  llvm::SmallVector<uint64_t> values;  // sorted, deduped
   bool incomplete = false;
 };
 
@@ -521,10 +521,10 @@ void joinValue(PcLatticeValue &dst, const PcLatticeValue &src) {
 //     is killed by the swap's transfer.
 //   * Anything else (block ended only because the next inst was an
 //     external BB leader): linear fallthrough.
-SmallVector<uint64_t, 2>
+SmallVector<uint64_t>
 computeSuccessors(const DecodedInst &lastInst, uint64_t nextBlockOffset,
                   bool nextBlockExists) {
-  SmallVector<uint64_t, 2> result;
+  SmallVector<uint64_t> result;
   auto branchTargetFromImm =
       [&](unsigned opIdx) -> std::optional<uint64_t> {
     if (opIdx >= lastInst.inst.getNumOperands())
@@ -996,7 +996,7 @@ SetPcAnalysis analyseSetPC(ArrayRef<DecodedInst> insts,
   // ---------------------------------------------------------------
 
   // Build predecessor map.
-  std::vector<llvm::SmallVector<size_t, 4>> predecessors(blocks.size());
+  std::vector<llvm::SmallVector<size_t>> predecessors(blocks.size());
   for (size_t bi = 0; bi < blocks.size(); ++bi) {
     for (uint64_t succOff : blocks[bi].successors) {
       auto sit = offsetToBlockIdx.find(succOff);
@@ -1135,8 +1135,8 @@ SetPcAnalysis analyseSetPC(ArrayRef<DecodedInst> insts,
       continue;
     }
 
-    SmallVector<uint64_t, 4> targets(it->second.values.begin(),
-                                     it->second.values.end());
+    SmallVector<uint64_t> targets(it->second.values.begin(),
+                                  it->second.values.end());
     SetPcSiteInfo info;
     if (targets.size() == 1) {
       info.kind = SetPcSiteInfo::Kind::DirectA;
@@ -1195,7 +1195,7 @@ SetPcAnalysis analyseSetPC(ArrayRef<DecodedInst> insts,
 
   // Build per-pair return-target lists for IndirectB from the
   // surviving terminators.
-  llvm::DenseMap<unsigned, SmallVector<uint64_t, 4>> targetsByPair;
+  llvm::DenseMap<unsigned, SmallVector<uint64_t>> targetsByPair;
   for (const auto &kv : result.chainTerminators) {
     if (!retPairsConsumedByB.count(kv.second.retPairLowReg))
       continue;

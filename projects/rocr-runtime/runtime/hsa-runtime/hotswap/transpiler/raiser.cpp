@@ -1143,7 +1143,7 @@ static RaiseResult raiseToIRImpl(llvm::ArrayRef<uint8_t> textBytes,
   // aggregate; any change to the dword-decomposition logic must keep
   // that fixture's `(i32 %arg0, i32 %arg1, i32 %arg2, i32 %arg3, ptr
   // addrspace(1) %arg4)` signature green.
-  SmallVector<Type *, 8> paramTypes;
+  SmallVector<Type *> paramTypes;
   KernargLayout kernargs;
   int paramIdx = 0;
   for (auto &arg : meta.args) {
@@ -2193,7 +2193,7 @@ static RaiseResult raiseToIRImpl(llvm::ArrayRef<uint8_t> textBytes,
   {
     DominatorTree DT(*F);
     AssumptionCache AC(*F);
-    SmallVector<AllocaInst *, 512> allocas;
+    SmallVector<AllocaInst *> allocas;
     regs.collectAllocas(allocas);
     ctx.collectSgprWaveMaskShadowAllocas(allocas);
     PromoteMemToReg(allocas, DT, &AC);

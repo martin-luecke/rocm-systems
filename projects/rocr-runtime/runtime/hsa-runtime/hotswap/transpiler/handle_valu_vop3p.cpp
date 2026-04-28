@@ -31,7 +31,7 @@ void parseBracketList3(StringRef text, StringRef key, int out[3]) {
   auto end = text.find(']', brk);
   if (end == StringRef::npos) return;
   StringRef inner = text.slice(brk + 1, end);
-  SmallVector<StringRef, 3> parts;
+  SmallVector<StringRef> parts;
   inner.split(parts, ',');
   for (unsigned i = 0; i < parts.size() && i < 3; i++) {
     int val = 0;
@@ -690,7 +690,7 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
     StringRef pseudoName = ctx.mc.instrInfo->getName(di.inst.getOpcode());
     StringRef body = pseudoName;
     body.consume_front("V_WMMA_SCALE_F32_16X16X128_F8F6F4_");
-    SmallVector<StringRef, 4> parts;
+    SmallVector<StringRef> parts;
     body.split(parts, '_');
     if (parts.size() < 2) {
       hr.failure = RaiseFailure::unsupportedShape(

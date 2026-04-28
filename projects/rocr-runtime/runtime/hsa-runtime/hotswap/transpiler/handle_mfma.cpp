@@ -140,7 +140,7 @@ HandlerResult handleMFMA(RaiseContext &ctx, const DecodedInst &di,
   // a v8i32 A/B layout (the widest F8 case) and select the active format
   // via `cbsz` / `blgp`, so we pass `{v8i32, v8i32}` here.
   auto *v8i32Ty = FixedVectorType::get(ctx.i32Ty, 8);
-  SmallVector<Type *, 2> overloads;
+  SmallVector<Type *> overloads;
   if (Intrinsic::isOverloaded(intrId))
     overloads = {v8i32Ty, v8i32Ty};
 

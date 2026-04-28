@@ -477,7 +477,7 @@ UseChainVerdict classifyForwardUseChain(
     SgprForcedConsumerKind &blockingKind,
     SmallPtrSetImpl<CallInst *> *sourceWaveReadFirstLaneSites = nullptr) {
   SmallPtrSet<Value *, 32> visited;
-  SmallVector<Value *, 16> worklist;
+  SmallVector<Value *> worklist;
   worklist.push_back(root);
 
   while (!worklist.empty()) {
@@ -1087,9 +1087,9 @@ CrossLaneDivergentRewriteReport rewriteCrossLaneDivergent(
   // of the i32-only rollout).  Any future widening of the rewrite
   // to i64 would add a split/recombine shim here alongside this
   // walk and need to update the symmetry invariant downstream.
-  SmallVector<CallInst *, 16> writelaneSites;
-  SmallVector<CallInst *, 16> readlaneSites;
-  SmallVector<CallInst *, 16> dppI32Sites;
+  SmallVector<CallInst *> writelaneSites;
+  SmallVector<CallInst *> readlaneSites;
+  SmallVector<CallInst *> dppI32Sites;
   SmallPtrSet<CallInst *, 16> readfirstlaneSites;
   for (Instruction &I : instructions(F)) {
     auto *CI = dyn_cast<CallInst>(&I);

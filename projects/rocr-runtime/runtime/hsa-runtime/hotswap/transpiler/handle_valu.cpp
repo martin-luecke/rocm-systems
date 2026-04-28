@@ -1446,7 +1446,7 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
       auto end = text.find(']', brk);
       if (brk != StringRef::npos && end != StringRef::npos) {
         StringRef inner = text.slice(brk + 1, end);
-        SmallVector<StringRef, 3> parts;
+        SmallVector<StringRef> parts;
         inner.split(parts, ',');
         for (unsigned i = 0; i < parts.size() && i < 3; i++) {
           int val = 0;
@@ -1687,7 +1687,7 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
       auto end = text.find(']', brk);
       if (brk != StringRef::npos && end != StringRef::npos) {
         StringRef inner = text.slice(brk + 1, end);
-        SmallVector<StringRef, 4> parts;
+        SmallVector<StringRef> parts;
         inner.split(parts, ',');
         for (unsigned i = 0; i < parts.size() && i < 4; i++) {
           int val = 0;
@@ -1822,7 +1822,7 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
       auto end = text.find(']', brk);
       if (brk != StringRef::npos && end != StringRef::npos) {
         StringRef inner = text.slice(brk + 1, end);
-        SmallVector<StringRef, 4> parts;
+        SmallVector<StringRef> parts;
         inner.split(parts, ',');
         if (!parts.empty()) {
           int parsed = 0;

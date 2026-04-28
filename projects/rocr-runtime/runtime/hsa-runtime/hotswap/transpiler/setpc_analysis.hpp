@@ -78,7 +78,7 @@ struct SetPcSiteInfo {
   // (each is the absolute kernel offset of a basic block leader that
   // is a chain-resolved value of the source pair on some incoming CFG
   // path). Same ordering contract.
-  llvm::SmallVector<uint64_t, 4> indirectTargets;
+  llvm::SmallVector<uint64_t> indirectTargets;
   // IndirectB: the SGPR low index of the source pair (for diagnostics
   // and so the handler can read the right pair).
   // DispatchSet: same — the SGPR low index of the source pair the

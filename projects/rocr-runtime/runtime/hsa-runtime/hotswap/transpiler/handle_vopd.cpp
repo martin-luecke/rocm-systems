@@ -342,7 +342,7 @@ HandlerResult handleVOPD(RaiseContext &ctx, const DecodedInst &di,
     return hr;
   }
 
-  SmallVector<std::pair<ParsedReg, Value *>, 4> pendingVGPRWrites;
+  SmallVector<std::pair<ParsedReg, Value *>> pendingVGPRWrites;
   bool xOk = lowerVopdHalf(ctx, di, di.vopd[AMDGPU::VOPD::ComponentIndex::X],
                            pendingVGPRWrites, hr);
   bool yOk = xOk && lowerVopdHalf(
