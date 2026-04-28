@@ -96,3 +96,18 @@ matmul_ogsdflt_dflt.matmul_ogs.2195296.003.pt
 
 The decomposed-BF16 control fixtures also pass with the same explicit
 `--salmon-num-stages 1` replay policy.
+
+## Runtime Scratch Follow-Up
+
+The native-MXFP4 E2E exposed a separate runtime integration issue after the
+fixture blockers moved: translated Salmon code objects can have a non-zero
+target `private_segment_fixed_size` from spills while the submitted AQL dispatch
+packet still carries `private_segment_size=0`. ROCR now repairs that mismatch in
+the insufficient-scratch handler by reading the loaded kernel descriptor before
+allocating scratch.
+
+Follow-up is still needed to move that reconciliation earlier in the dispatch
+path, ideally when packet resource metadata is produced or intercepted. The
+async scratch handler should remain a safety net with structured diagnostics,
+not the first place a valid translated kernel's scratch requirement becomes
+visible to the runtime.
