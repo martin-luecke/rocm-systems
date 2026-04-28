@@ -821,10 +821,16 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
     SeedB.CreateStore(ConstantInt::get(i32Ty, 0), regs.flatScr[0]);
     SeedB.CreateStore(ConstantInt::get(i32Ty, 0), regs.flatScr[1]);
 
+    // Mirror the entry-BB user-SGPR seeding above: the kernarg pair is
+    // re-seeded with `amdgcn_kernarg_segment_ptr` so kernarg SMEM loads
+    // inside the thread-loop iteration body lift through the same
+    // GEP+load shape, and preloaded-kernarg SGPRs materialise their
+    // dwords via the same intrinsic + GEP + i32 load. Hidden block
+    // counts continue to flow through `emitPreloadedHiddenKernargDword`
+    // (dispatch-packet synthesis, not in kernarg memory).
     if (userSgprLayout.kernargSegmentPtrSgpr >= 0) {
-      regs.storeSGPR64(
-          SeedB, userSgprLayout.kernargSegmentPtrSgpr,
-          Constant::getNullValue(PointerType::get(C, 4)));
+      regs.storeSGPR64(SeedB, userSgprLayout.kernargSegmentPtrSgpr,
+                       SeedB.CreateCall(fnKargPtr, {}, "kernarg_ptr"));
     }
     if (userSgprLayout.workgroupIdXSgpr >= 0) {
       regs.storeSGPR32(SeedB, userSgprLayout.workgroupIdXSgpr,
@@ -839,16 +845,14 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
       const auto &entry = userSgprLayout.entries[sgprIdx];
       if (entry.source != UserSgprLayout::Source::PreloadedKernarg)
         continue;
-      std::string why;
       Value *dw = emitPreloadedHiddenKernargDword(entry.kernargByteOffset);
-      if (!dw)
-        dw = extractKernargDword(kernargs, SeedB, F,
-                                 entry.kernargByteOffset, &why);
       if (!dw) {
-        report_fatal_error(
-            Twine("transpiler: failed to seed preloaded kernarg SGPR s") +
-            Twine(static_cast<int>(sgprIdx)) + " at byte offset " +
-            Twine(entry.kernargByteOffset) + ": " + why);
+        Value *segPtr =
+            SeedB.CreateCall(fnKargPtr, {}, "preload_kernarg_ptr");
+        Value *gep = SeedB.CreateInBoundsGEP(
+            i8Ty, segPtr, SeedB.getInt64(entry.kernargByteOffset),
+            "preload_gep");
+        dw = SeedB.CreateAlignedLoad(i32Ty, gep, Align(4), "preload_dw");
       }
       regs.storeSGPR32(SeedB, static_cast<int>(sgprIdx), dw);
     }
