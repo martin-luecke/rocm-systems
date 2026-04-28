@@ -12,6 +12,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
@@ -152,6 +153,117 @@ void writeCarryOutI1(RaiseContext &ctx, const DecodedInst &di,
     }
   }
   ctx.regs.storeVCC(ctx.B, carryI1);
+}
+
+// ============================================================================
+// FP8 read-side conversions — portable IR shape.
+//
+// For OCP-FP8 source ISAs (gfx950, gfx1170, gfx1200, gfx1250, …) we lift
+// the FP8 / BF8 read-side family
+//
+//   V_CVT_F32_{FP8,BF8}     V_CVT_PK_F32_{FP8,BF8}
+//   V_CVT_F16_{FP8,BF8}     V_CVT_PK_F16_{FP8,BF8}
+//
+// through the generic `llvm.convert.from.arbitrary.fp` intrinsic
+// instead of the AMDGCN-specific
+// `llvm.amdgcn.cvt.{,pk_}{f32,f16}.{fp8,bf8}` family. This is strictly
+// higher-level: the AMDGPU backend custom-lowers the portable intrinsic
+// back to the same V_CVT instructions on capable targets per PR
+// llvm/llvm-project#194144 (the f32 destination shapes ship in the
+// first commit; f16 destinations are added in the follow-up commit on
+// the same PR) and falls through to the generic SelectionDAG
+// bit-twiddling expansion (`LegalizeDAG.cpp::CONVERT_FROM_ARBITRARY_FP`)
+// on every other target — so cross-ISA re-lowering keeps working out
+// of the box even when the destination target has no FP8 conversion
+// hardware.
+//
+// gfx9.4.0 (gfx942) is intentionally NOT on this path. Its hardware
+// reads FP8 lanes with FNUZ semantics (`Float8E4M3FNUZ` /
+// `Float8E5M2FNUZ`), which neither `APFloatBase::getArbitraryFPSemantics`
+// nor LegalizeDAG's expansion currently understand — emitting a
+// `convert.from.arbitrary.fp` with FNUZ metadata against today's LLVM
+// would error out at SelectionDAG legalization. gfx942 lifts therefore
+// stay on the AMDGCN intrinsic, whose semantics are target-defined and
+// silently track the source/target subtarget bits.
+//
+// The dispatch toggle lives on `ISAProfile::hasOcpFp8` (set in
+// `isa_profile.hpp::fromSubtarget`). Callers route through this helper
+// only when `ctx.isa.hasOcpFp8` is true.
+//
+// Parameters:
+//   srcI32     — the 32-bit packed source register. Bytes 0..3 are the
+//                FP8 lanes; the hardware reads byte 0 (V_CVT_*_F32_/F16_)
+//                or the low/high 16 bits (V_CVT_PK_*) per `wordSel`.
+//   dstEltFltTy — `ctx.f32Ty` for the f32 read-side
+//                (V_CVT_{,PK_}F32_{FP8,BF8}) or `ctx.f16Ty` for the f16
+//                read-side (V_CVT_{,PK_}F16_{FP8,BF8}). Per-lane
+//                destination element type; the helper builds the
+//                aggregate (scalar or v2) on top of this.
+//   numLanes   — 1 (V_CVT_*_FP8 / V_CVT_*_BF8) or 2 (V_CVT_PK_* family).
+//   wordSel    — 0 or 1: which 16-bit half of `srcI32` carries the
+//                lanes for `numLanes == 2`. Ignored otherwise (the
+//                corpus only ever uses byte 0 for the scalar forms,
+//                and the V_CVT_*_{FP8,BF8} callers already refuse any
+//                non-default `op_sel:` / SDWA byte selector before
+//                reaching here).
+//   isBf8      — true for V_CVT_*_BF8 (E5M2), false for V_CVT_*_FP8
+//                (E4M3FN).
+//
+// Returns a Value of type `dstEltFltTy` (numLanes == 1) or
+// `<2 x dstEltFltTy>` (numLanes == 2).
+llvm::Value *emitFp8ReadAsConvertFromArbitraryFp(RaiseContext &ctx,
+                                                 llvm::Value *srcI32,
+                                                 llvm::Type *dstEltFltTy,
+                                                 unsigned numLanes,
+                                                 unsigned wordSel,
+                                                 bool isBf8) {
+  assert(numLanes == 1 || numLanes == 2);
+  assert(ctx.isa.hasOcpFp8 &&
+         "convert.from.arbitrary.fp lift requested for non-OCP FP8 source — "
+         "the IR-level intrinsic does not know FNUZ semantics today");
+  assert(dstEltFltTy->isFloatingPointTy() &&
+         "FP8 read-side destination element must be a floating-point type");
+
+  if (srcI32->getType() != ctx.i32Ty)
+    srcI32 = ctx.B.CreateBitOrPointerCast(srcI32, ctx.i32Ty);
+
+  // Slice the bytes the hardware would have decoded out of the packed
+  // dword. Scalar form: byte 0. Packed form: the 2-byte half selected
+  // by `wordSel` (op_sel:[0]).
+  llvm::Type *srcIntTy = nullptr;
+  llvm::Value *srcInt = nullptr;
+  if (numLanes == 1) {
+    srcInt = ctx.B.CreateTrunc(srcI32, ctx.i8Ty, "fp8_byte");
+    srcIntTy = ctx.i8Ty;
+  } else {
+    llvm::Value *shifted =
+        wordSel
+            ? ctx.B.CreateLShr(srcI32, llvm::ConstantInt::get(ctx.i32Ty, 16))
+            : srcI32;
+    llvm::Value *halfI16 = ctx.B.CreateTrunc(
+        shifted, llvm::Type::getInt16Ty(ctx.C), "fp8_half");
+    srcIntTy = llvm::FixedVectorType::get(ctx.i8Ty, 2);
+    srcInt = ctx.B.CreateBitCast(halfI16, srcIntTy, "fp8_lanes");
+  }
+
+  llvm::Type *dstFltTy =
+      (numLanes == 1)
+          ? dstEltFltTy
+          : static_cast<llvm::Type *>(
+                llvm::FixedVectorType::get(dstEltFltTy, 2));
+
+  // OCP semantics names. `APFloatBase::getArbitraryFPSemantics` only
+  // recognises this set today; the AMDGPU custom lowering and the
+  // generic SelectionDAG expansion both gate on exactly these.
+  llvm::StringRef fmtStr = isBf8 ? "Float8E5M2" : "Float8E4M3FN";
+  llvm::MDString *fmtMd = llvm::MDString::get(ctx.C, fmtStr);
+  llvm::Value *fmtArg = llvm::MetadataAsValue::get(ctx.C, fmtMd);
+
+  llvm::Function *cvtFn = llvm::Intrinsic::getOrInsertDeclaration(
+      &ctx.M, llvm::Intrinsic::convert_from_arbitrary_fp,
+      {dstFltTy, srcIntTy});
+  return ctx.B.CreateCall(cvtFn, {srcInt, fmtArg},
+                          isBf8 ? "cvt_from_bf8" : "cvt_from_fp8");
 }
 
 // Emit the cross-target (gfx1250 -> gfx94x) dequantisation expansion
@@ -1810,9 +1922,19 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
   // is a v2f32 pair, not a half-register, so the assembler always
   // prints `0` there. We refuse loudly if op_sel parsing produces a
   // value outside {0,1} so corpus drift surfaces immediately rather
-  // than silently flipping the word selector. Lowering selects the
-  // matching `llvm.amdgcn.cvt.pk.f32.{fp8,bf8}` intrinsic and
-  // bitcasts its v2f32 result to i64 before writeReg64.
+  // than silently flipping the word selector.
+  //
+  // Lift shape:
+  //   * OCP-FP8 source ISA (gfx950 / gfx1170 / gfx1200 / gfx1250 /
+  //     `ctx.isa.hasOcpFp8`): emit the portable
+  //     `llvm.convert.from.arbitrary.fp.<v2f32>.<v2i8>` intrinsic. The
+  //     AMDGPU backend custom-lowers it back to V_CVT_PK_F32_{FP8,BF8}
+  //     on capable targets (PR llvm/llvm-project#194144) and falls
+  //     through to a generic SelectionDAG expansion otherwise.
+  //   * gfx9.4.0 (gfx942, FNUZ): stays on the
+  //     `llvm.amdgcn.cvt.pk.f32.{fp8,bf8}` AMDGCN intrinsic — the
+  //     generic intrinsic does not currently know FNUZ semantics
+  //     (`APFloatBase::getArbitraryFPSemantics` only matches OCP).
   if (sop == SemOp::V_CVT_PK_F32_FP8 || sop == SemOp::V_CVT_PK_F32_BF8) {
     int wordSelInt = 0;
     StringRef text(di.fullText);
@@ -1840,14 +1962,20 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
     Value *src = op.src(0);
     if (src->getType() != ctx.i32Ty)
       src = ctx.B.CreateBitOrPointerCast(src, ctx.i32Ty);
-    Intrinsic::ID iid = (sop == SemOp::V_CVT_PK_F32_FP8)
-                            ? Intrinsic::amdgcn_cvt_pk_f32_fp8
-                            : Intrinsic::amdgcn_cvt_pk_f32_bf8;
-    Function *cvtFn = Intrinsic::getOrInsertDeclaration(&ctx.M, iid);
-    Value *v2 = ctx.B.CreateCall(cvtFn,
-        {src, ConstantInt::get(ctx.i1Ty, wordSelInt != 0)},
-        sop == SemOp::V_CVT_PK_F32_FP8 ? "cvt_pk_f32_fp8"
-                                       : "cvt_pk_f32_bf8");
+    const bool isBf8 = (sop == SemOp::V_CVT_PK_F32_BF8);
+    Value *v2 = nullptr;
+    if (ctx.isa.hasOcpFp8) {
+      v2 = emitFp8ReadAsConvertFromArbitraryFp(
+          ctx, src, /*dstEltFltTy=*/ctx.f32Ty, /*numLanes=*/2,
+          /*wordSel=*/static_cast<unsigned>(wordSelInt), isBf8);
+    } else {
+      Intrinsic::ID iid = isBf8 ? Intrinsic::amdgcn_cvt_pk_f32_bf8
+                                : Intrinsic::amdgcn_cvt_pk_f32_fp8;
+      Function *cvtFn = Intrinsic::getOrInsertDeclaration(&ctx.M, iid);
+      v2 = ctx.B.CreateCall(cvtFn,
+                            {src, ConstantInt::get(ctx.i1Ty, wordSelInt != 0)},
+                            isBf8 ? "cvt_pk_f32_bf8" : "cvt_pk_f32_fp8");
+    }
     ctx.writeReg64(op.dst(), ctx.B.CreateBitCast(v2, ctx.i64Ty));
     hr.handled = true;
     return hr;
@@ -1859,6 +1987,14 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
   // gfx1250 kernel today. We refuse loudly if disassembly carries an
   // op_sel: marker so corpus drift surfaces instead of a silent
   // byte-0 collapse.
+  //
+  // Lift shape: same dispatch as the packed sibling above — OCP-FP8
+  // sources go through the portable
+  // `llvm.convert.from.arbitrary.fp.f32.i8` intrinsic (target-agnostic;
+  // PR llvm/llvm-project#194144 selects the hardware instruction back
+  // on capable AMDGPU targets); gfx9.4.0 stays on
+  // `llvm.amdgcn.cvt.f32.{fp8,bf8}` because the generic intrinsic
+  // does not yet know FNUZ semantics.
   if (sop == SemOp::V_CVT_F32_FP8 || sop == SemOp::V_CVT_F32_BF8) {
     StringRef text(di.fullText);
     if (text.contains("op_sel:") || text.contains("_sdwa")) {
@@ -1871,14 +2007,163 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
     Value *src = op.src(0);
     if (src->getType() != ctx.i32Ty)
       src = ctx.B.CreateBitOrPointerCast(src, ctx.i32Ty);
-    Intrinsic::ID iid = (sop == SemOp::V_CVT_F32_FP8)
-                            ? Intrinsic::amdgcn_cvt_f32_fp8
-                            : Intrinsic::amdgcn_cvt_f32_bf8;
-    Function *cvtFn = Intrinsic::getOrInsertDeclaration(&ctx.M, iid);
-    Value *f = ctx.B.CreateCall(cvtFn,
-        {src, ConstantInt::get(ctx.i32Ty, 0)},
-        sop == SemOp::V_CVT_F32_FP8 ? "cvt_f32_fp8" : "cvt_f32_bf8");
+    const bool isBf8 = (sop == SemOp::V_CVT_F32_BF8);
+    Value *f = nullptr;
+    if (ctx.isa.hasOcpFp8) {
+      f = emitFp8ReadAsConvertFromArbitraryFp(
+          ctx, src, /*dstEltFltTy=*/ctx.f32Ty, /*numLanes=*/1,
+          /*wordSel=*/0, isBf8);
+    } else {
+      Intrinsic::ID iid =
+          isBf8 ? Intrinsic::amdgcn_cvt_f32_bf8 : Intrinsic::amdgcn_cvt_f32_fp8;
+      Function *cvtFn = Intrinsic::getOrInsertDeclaration(&ctx.M, iid);
+      f = ctx.B.CreateCall(cvtFn,
+                           {src, ConstantInt::get(ctx.i32Ty, 0)},
+                           isBf8 ? "cvt_f32_bf8" : "cvt_f32_fp8");
+    }
     ctx.writeReg32(op.dst(), ctx.B.CreateBitCast(f, ctx.i32Ty));
+    hr.handled = true;
+    return hr;
+  }
+  // VOP1 single-lane v_cvt_f16_{fp8,bf8} (gfx1250+, VOP1Instructions.td:842).
+  // Same shape as the f32 sibling above but produces f16. The destination
+  // is a t16 register on gfx1250 — disassembled as `v<N>.l` (low 16 bits
+  // of v<N>) for the default form, `v<N>.h` to write only the high 16
+  // bits. The transpiler's register-file model does not yet split VGPRs
+  // into 16-bit halves: a `.l` write through `writeReg32` zeros the high
+  // half (good enough for kernels that don't read it), while a `.h`
+  // write would clobber the live-low half and corrupt unrelated state
+  // — refuse loudly until t16 modelling lands.
+  //
+  // Lift dispatch identical to V_CVT_F32_{FP8,BF8} above:
+  //   * `ctx.isa.hasOcpFp8`  -> portable
+  //     `llvm.convert.from.arbitrary.fp.f16.i8(i8 byte0, metadata !"...")`
+  //   * Otherwise (no in-tree generation today carries the f16 read shape
+  //     without OCP, but kept for symmetry / future-proofing) ->
+  //     `llvm.amdgcn.cvt.f16.{fp8,bf8}(i32 src, i32 byte_sel=0)`.
+  if (sop == SemOp::V_CVT_F16_FP8 || sop == SemOp::V_CVT_F16_BF8) {
+    StringRef text(di.fullText);
+    if (text.contains("op_sel:") || text.contains("_sdwa")) {
+      hr.failure = RaiseFailure::unsupportedShape(
+          di, "VOP1",
+          "non-default op_sel/sdwa byte_sel on v_cvt_f16_{fp8,bf8} "
+          "(only the byte_sel=0 e64 form is wired today)");
+      return hr;
+    }
+    // T16 dst high-half write: refuse because writeReg32 would clobber
+    // the live low half. The dst register text appears between the
+    // mnemonic and the first comma; `.h` only ever appears on a t16
+    // register reference, so a substring check on that prefix is
+    // sufficient and not subject to false positives from immediates.
+    auto firstComma = text.find(',');
+    if (firstComma != StringRef::npos &&
+        text.substr(0, firstComma).contains(".h")) {
+      hr.failure = RaiseFailure::unsupportedShape(
+          di, "VOP1",
+          "v_cvt_f16_{fp8,bf8} with t16 high-half destination "
+          "(`v<N>.h`) is not wired — the register-file model does not "
+          "yet split VGPRs into 16-bit halves and writeReg32 would "
+          "clobber the live low half");
+      return hr;
+    }
+    Value *src = op.src(0);
+    if (src->getType() != ctx.i32Ty)
+      src = ctx.B.CreateBitOrPointerCast(src, ctx.i32Ty);
+    const bool isBf8 = (sop == SemOp::V_CVT_F16_BF8);
+    Value *h = nullptr;
+    if (ctx.isa.hasOcpFp8) {
+      h = emitFp8ReadAsConvertFromArbitraryFp(
+          ctx, src, /*dstEltFltTy=*/ctx.f16Ty, /*numLanes=*/1,
+          /*wordSel=*/0, isBf8);
+    } else {
+      Intrinsic::ID iid =
+          isBf8 ? Intrinsic::amdgcn_cvt_f16_bf8 : Intrinsic::amdgcn_cvt_f16_fp8;
+      Function *cvtFn = Intrinsic::getOrInsertDeclaration(&ctx.M, iid);
+      h = ctx.B.CreateCall(cvtFn,
+                           {src, ConstantInt::get(ctx.i32Ty, 0)},
+                           isBf8 ? "cvt_f16_bf8" : "cvt_f16_fp8");
+    }
+    // f16 → i16 → zext to i32 to land in the 32-bit register file
+    // (mirrors V_CVT_F16_F32's writeback shape in handle_valu_small_ops.cpp).
+    Value *bits = ctx.B.CreateBitCast(h, Type::getInt16Ty(ctx.C));
+    ctx.writeReg32(op.dst(), ctx.B.CreateZExt(bits, ctx.i32Ty));
+    hr.handled = true;
+    return hr;
+  }
+  // VOP1 packed v_cvt_pk_f16_{fp8,bf8} (gfx1250+, VOP1Instructions.td:846).
+  // Reads two FP8/BF8 lanes from the low or high 16 bits of `src`,
+  // producing v2f16 written to a full 32-bit dst. On gfx1250 the half
+  // selection is encoded in the t16 register class of the source —
+  // disassembled as `v<N>.l` (read low 16 bits, default) or `v<N>.h`
+  // (read high 16 bits, equivalent to op_sel:[0]=1 on the f32 sibling
+  // V_CVT_PK_F32_{FP8,BF8}). We parse the source-side suffix out of the
+  // disassembly text. The `.l` / `.h` substrings only ever appear on
+  // t16 register operands, so a substring check on the source slice
+  // (everything after the first comma) is sufficient.
+  if (sop == SemOp::V_CVT_PK_F16_FP8 || sop == SemOp::V_CVT_PK_F16_BF8) {
+    int wordSelInt = 0;
+    StringRef text(di.fullText);
+    auto firstComma = text.find(',');
+    StringRef srcSlice = (firstComma != StringRef::npos)
+                             ? text.substr(firstComma)
+                             : StringRef();
+    if (srcSlice.contains(".h"))
+      wordSelInt = 1;
+    else if (srcSlice.contains(".l"))
+      wordSelInt = 0;
+    // Legacy `op_sel:[X,...]` form — preserved for symmetry with the
+    // F32 sibling and for any future encoding that prefers the explicit
+    // modifier text over the t16 register-suffix form.
+    auto pos = text.find("op_sel:");
+    if (pos != StringRef::npos) {
+      auto brk = text.find('[', pos);
+      auto end = text.find(']', brk);
+      if (brk != StringRef::npos && end != StringRef::npos) {
+        StringRef inner = text.slice(brk + 1, end);
+        SmallVector<StringRef, 4> parts;
+        inner.split(parts, ',');
+        if (!parts.empty()) {
+          int parsed = 0;
+          if (parts[0].trim().getAsInteger(10, parsed) ||
+              (parsed != 0 && parsed != 1)) {
+            hr.failure = RaiseFailure::unsupportedShape(
+                di, "VOP1",
+                "unparseable or out-of-range op_sel[0] on "
+                "v_cvt_pk_f16_{fp8,bf8} (expected 0 or 1)");
+            return hr;
+          }
+          wordSelInt = parsed;
+        }
+      }
+    }
+    Value *src = op.src(0);
+    if (src->getType() != ctx.i32Ty)
+      src = ctx.B.CreateBitOrPointerCast(src, ctx.i32Ty);
+    const bool isBf8 = (sop == SemOp::V_CVT_PK_F16_BF8);
+    Value *v2 = nullptr;
+    if (ctx.isa.hasOcpFp8) {
+      v2 = emitFp8ReadAsConvertFromArbitraryFp(
+          ctx, src, /*dstEltFltTy=*/ctx.f16Ty, /*numLanes=*/2,
+          /*wordSel=*/static_cast<unsigned>(wordSelInt), isBf8);
+    } else {
+      // AMDGCN intrinsic takes the 16 bits the hardware would have
+      // decoded as `i16` directly; do the half-word slice ourselves
+      // and trunc into the right shape.
+      Value *shifted =
+          wordSelInt
+              ? ctx.B.CreateLShr(src, ConstantInt::get(ctx.i32Ty, 16))
+              : src;
+      Value *halfI16 =
+          ctx.B.CreateTrunc(shifted, Type::getInt16Ty(ctx.C), "fp8_half");
+      Intrinsic::ID iid = isBf8 ? Intrinsic::amdgcn_cvt_pk_f16_bf8
+                                : Intrinsic::amdgcn_cvt_pk_f16_fp8;
+      Function *cvtFn = Intrinsic::getOrInsertDeclaration(&ctx.M, iid);
+      v2 = ctx.B.CreateCall(cvtFn, {halfI16},
+                            isBf8 ? "cvt_pk_f16_bf8" : "cvt_pk_f16_fp8");
+    }
+    // v2f16 is exactly 32 bits — bitcast to i32 and writeReg32 (mirrors
+    // V_CVT_PK_BF16_F32's writeback shape above).
+    ctx.writeReg32(op.dst(), ctx.B.CreateBitCast(v2, ctx.i32Ty));
     hr.handled = true;
     return hr;
   }

@@ -41,6 +41,35 @@ struct ISAProfile {
   // GFX6-GFX120 field to a 6-bit field. Keep this as an ABI property rather
   // than deriving it from a string at each use site.
   bool hasGfx125UserSgprCountField = false;
+  // True iff the subtarget exposes the `v_cvt_{,pk_}f32_{fp8,bf8}` /
+  // `v_cvt_{,pk_}f16_{fp8,bf8}` family — `FeatureFP8ConversionInsts` in
+  // AMDGPU.td. Present on gfx9.4.0 (gfx942) and onward (gfx950, gfx1170,
+  // gfx1200, gfx1250, …). The hardware reads one or two FP8 lanes out of
+  // a packed VGPR and produces native f32 / f16 / v2f32 / v2f16 values.
+  bool hasFp8ConversionInsts = false;
+  // True iff the FP8 conversion hardware on this subtarget interprets its
+  // 8-bit input lanes with the OCP semantics (`Float8E4M3FN` for FP8,
+  // `Float8E5M2` for BF8) rather than the AMD-legacy FNUZ semantics
+  // (`Float8E4M3FNUZ` / `Float8E5M2FNUZ`) used by gfx9.4.0 / gfx942.
+  //
+  // The distinction matters for **lifting** FP8 read-side conversions
+  // (`V_CVT_{,PK_}F32_{FP8,BF8}`) to portable IR. Today the only target
+  // generic LLVM (`APFloatBase::getArbitraryFPSemantics`,
+  // `LegalizeDAG.cpp::CONVERT_FROM_ARBITRARY_FP`) handles is the OCP set;
+  // FNUZ is not lowerable through `llvm.convert.from.arbitrary.fp` at
+  // all. Lifting gfx942 reads must therefore stay on the
+  // `llvm.amdgcn.cvt.f32.{fp8,bf8}` AMDGCN intrinsic, whose semantics
+  // are target-defined and silently flip with the subtarget. Lifting
+  // gfx950+ reads can use the portable IR shape, which the AMDGPU
+  // backend custom-lowers back to the same hardware instructions on
+  // capable targets (PR llvm/llvm-project#194144) and which the
+  // generic SelectionDAG expansion handles as bit-twiddling on every
+  // other target.
+  //
+  // Detection: `FeatureFP8ConversionInsts` minus the gfx9.4.0 footprint
+  // (`FeatureFP8Insts && !FeatureGFX950Insts`). gfx9.4.0 is the only
+  // FNUZ-FP8 generation in tree.
+  bool hasOcpFp8 = false;
 
   bool isWave32() const { return waveSize == 32; }
 
@@ -57,6 +86,17 @@ struct ISAProfile {
                   STI.hasFeature(llvm::AMDGPU::FeatureWMMA256bInsts);
     p.hasTensorOps = STI.hasFeature(llvm::AMDGPU::FeatureGFX1250Insts);
     p.hasGfx125UserSgprCountField = llvm::AMDGPU::isGFX1250Plus(STI);
+    p.hasFp8ConversionInsts =
+        STI.hasFeature(llvm::AMDGPU::FeatureFP8ConversionInsts);
+    // gfx9.4.0 (gfx942) is the sole FNUZ-FP8 generation in tree:
+    // `FeatureFP8Insts` is set on every gfx9.4.x but `FeatureGFX950Insts`
+    // gates on / off as we cross gfx942 → gfx950, where the OCP FP8
+    // formats took over. Anywhere else with the FP8 conversion family
+    // (gfx1170, gfx1200, gfx1250, …) is OCP by default — those targets
+    // never carry `FeatureFP8Insts` at all.
+    const bool isGfx942Fnuz = STI.hasFeature(llvm::AMDGPU::FeatureFP8Insts) &&
+                              !STI.hasFeature(llvm::AMDGPU::FeatureGFX950Insts);
+    p.hasOcpFp8 = p.hasFp8ConversionInsts && !isGfx942Fnuz;
     return p;
   }
 

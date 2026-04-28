@@ -350,6 +350,14 @@ static const Entry kCanonTable[] = {
     E(V_CVT_PK_F32_BF8_e64, V_CVT_PK_F32_BF8),
     E(V_CVT_F32_FP8_e64, V_CVT_F32_FP8),
     E(V_CVT_F32_BF8_e64, V_CVT_F32_BF8),
+    // gfx1250+ FP8/BF8 -> F16 read-side family. Real subtarget /
+    // t16 / fake16 forms collapse onto the base `_e64` pseudo via the
+    // canonicaliser's `_t16_` / `_fake16_` suffix-stripping rules
+    // (see the variant table at the bottom of this file).
+    E(V_CVT_F16_FP8_e64, V_CVT_F16_FP8),
+    E(V_CVT_F16_BF8_e64, V_CVT_F16_BF8),
+    E(V_CVT_PK_F16_FP8_e64, V_CVT_PK_F16_FP8),
+    E(V_CVT_PK_F16_BF8_e64, V_CVT_PK_F16_BF8),
     // gfx1250-only packed-8 FP4 -> BF16 scaled convert
     // (VOP3Instructions.td:1788). The real form
     // `V_CVT_SCALE_PK8_BF16_FP4_e64_gfx1250` canonicalises onto the

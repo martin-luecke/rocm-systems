@@ -117,6 +117,16 @@ bool isIntrinsicVGPRSafePropagator(Intrinsic::ID id) {
   case Intrinsic::amdgcn_cvt_pk_f32_bf8:
   case Intrinsic::amdgcn_cvt_pk_f32_fp8:
   case Intrinsic::amdgcn_cvt_pk_fp8_f32:
+  // gfx1250+ FP8/BF8 -> F16 read-side companions, see
+  // V_CVT_F16_{FP8,BF8} / V_CVT_PK_F16_{FP8,BF8} in handle_valu.cpp.
+  case Intrinsic::amdgcn_cvt_f16_bf8:
+  case Intrinsic::amdgcn_cvt_f16_fp8:
+  case Intrinsic::amdgcn_cvt_pk_f16_bf8:
+  case Intrinsic::amdgcn_cvt_pk_f16_fp8:
+  // Portable IR-level FP8 reader, emitted in lieu of the AMDGCN
+  // intrinsics for OCP-FP8 source ISAs (gfx950+). Lane-pure: each
+  // result lane only depends on the corresponding source byte(s).
+  case Intrinsic::convert_from_arbitrary_fp:
   case Intrinsic::amdgcn_cvt_pkrtz:
   case Intrinsic::amdgcn_cvt_scalef32_pk_fp4_f32:
   case Intrinsic::amdgcn_cvt_scale_pk8_bf16_fp4:

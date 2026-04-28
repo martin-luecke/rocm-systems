@@ -353,6 +353,37 @@ enum class SemOp : uint16_t {
   // future corpus drift surfaces immediately rather than silently
   // collapsing to byte 0.
   V_CVT_F32_FP8, V_CVT_F32_BF8,
+  // VOP1 FP8/BF8 → F16 conversions (gfx1250+ only,
+  // VOP1Instructions.td:840-865). The hardware family adds an f16
+  // destination to the existing FP8 read-side. Two shapes:
+  //
+  //   * V_CVT_F16_{FP8,BF8}: scalar single-lane decode, src is i32 with
+  //     a 2-bit byte_sel imm picking lane 0..3. The TableGen pattern
+  //     (`Cvt_F_F8_Pat_ByteSel`) lowers
+  //     `llvm.amdgcn.cvt.f16.{fp8,bf8}(i32 src, i32 imm byte_sel)` to
+  //     the t16/fake16 e64 encoding.
+  //
+  //   * V_CVT_PK_F16_{FP8,BF8}: packed two-lane decode, src is the low
+  //     16 bits of a VGPR (the `op_sel:[X]` flag picks low/high half),
+  //     producing v2f16. The TableGen pseudo declares the source type
+  //     as `i16` (`VOPProfile_CVT_PK_F16_F8`); the matching intrinsic
+  //     `llvm.amdgcn.cvt.pk.f16.{fp8,bf8}(i16 src)` mirrors that.
+  //
+  // Lift shape mirrors the F32 read-side companions above:
+  //   * `ctx.isa.hasOcpFp8`  -> portable
+  //     `llvm.convert.from.arbitrary.fp.{f16,v2f16}.{i8,v2i8}` with the
+  //     OCP semantics metadata (`Float8E4M3FN` / `Float8E5M2`). The
+  //     AMDGPU backend is expected to custom-lower this back to the
+  //     hardware family per PR llvm/llvm-project#194144 (the f16
+  //     destination is part of the second commit on that PR).
+  //   * Otherwise (no in-tree generation today; all FP8-conv targets
+  //     before gfx1250 lack the f16 read shape) -> the AMDGCN
+  //     `llvm.amdgcn.cvt.{,pk_}f16.{fp8,bf8}` intrinsic. Kept for
+  //     symmetry with the f32 sibling and to make a corpus drift to
+  //     a future FNUZ-with-f16 generation surface as a graceful
+  //     fallback rather than a missing handler.
+  V_CVT_F16_FP8, V_CVT_F16_BF8,
+  V_CVT_PK_F16_FP8, V_CVT_PK_F16_BF8,
   // VOP3 scaled packed-8 FP4 → BF16 conversion (gfx1250 only,
   // VOP3Instructions.td:1788; LLVM opcode V_CVT_SCALE_PK8_BF16_FP4_e64,
   // real form `..._gfx1250`).  Reads 1 VGPR of packed 8xFP4 (4 bits
