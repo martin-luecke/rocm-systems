@@ -763,7 +763,7 @@ private:
 // Main raising function
 // ============================================================================
 
-static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
+static RaiseResult raiseToIRImpl(llvm::ArrayRef<uint8_t> textBytes,
                                  llvm::StringRef sourceISA,
                                  llvm::StringRef kernelName,
                                  const KernelMeta &meta,
@@ -2519,7 +2519,7 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
   return result;
 }
 
-RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
+RaiseResult raiseToIR(llvm::ArrayRef<uint8_t> textBytes,
                       llvm::StringRef sourceISA,
                       llvm::StringRef kernelName,
                       const KernelMeta &meta,
