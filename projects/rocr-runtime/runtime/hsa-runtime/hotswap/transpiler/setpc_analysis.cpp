@@ -1174,20 +1174,22 @@ SetPcAnalysis analyseSetPC(ArrayRef<DecodedInst> insts,
     }
   }
 
-  // Prune chain terminators.
-  for (auto it = result.chainTerminators.begin();
-       it != result.chainTerminators.end();) {
-    bool keepForB = retPairsConsumedByB.count(it->second.retPairLowReg);
+  // Prune chain terminators. DenseMap::erase does not return an
+  // iterator, so collect the offsets to drop in a first pass and
+  // erase them in a second pass.
+  llvm::SmallVector<uint64_t> toErase;
+  for (const auto &kv : result.chainTerminators) {
+    bool keepForB = retPairsConsumedByB.count(kv.second.retPairLowReg);
     bool keepForDispatch = false;
-    auto dt = dispatchSetTargets.find(it->second.retPairLowReg);
+    auto dt = dispatchSetTargets.find(kv.second.retPairLowReg);
     if (dt != dispatchSetTargets.end() &&
-        dt->second.count(it->second.resolvedReturnAddr))
+        dt->second.count(kv.second.resolvedReturnAddr))
       keepForDispatch = true;
     if (!keepForB && !keepForDispatch)
-      it = result.chainTerminators.erase(it);
-    else
-      ++it;
+      toErase.push_back(kv.first);
   }
+  for (uint64_t off : toErase)
+    result.chainTerminators.erase(off);
 
   // Build per-pair return-target lists for IndirectB from the
   // surviving terminators.
