@@ -42,19 +42,30 @@
 
 cmake_minimum_required ( VERSION 3.7 )
 
-# Import target 'clang' and 'llvm-objcopy'
-find_package(Clang REQUIRED HINTS ${CMAKE_PREFIX_PATH}/llvm PATHS /opt/rocm/llvm )
-find_package(LLVM REQUIRED HINTS ${CMAKE_PREFIX_PATH}/llvm PATHS /opt/rocm/llvm )
+# The trap-handler build only needs the tool executables.  Importing Clang's
+# CMake package also imports its full LLVM target graph, which unnecessarily
+# couples this runtime helper to the LLVM libraries used by optional HotSwap
+# components in the parent build.
+find_program(ROCR_TRAP_HANDLER_CLANG clang
+  HINTS ${CMAKE_PREFIX_PATH} /opt/rocm/llvm /opt/rocm
+  PATH_SUFFIXES bin)
+find_program(ROCR_TRAP_HANDLER_LLVM_OBJCOPY llvm-objcopy
+  HINTS ${CMAKE_PREFIX_PATH} /opt/rocm/llvm /opt/rocm
+  PATH_SUFFIXES bin)
+if(NOT ROCR_TRAP_HANDLER_CLANG)
+  message(FATAL_ERROR "clang executable not found for trap-handler assembly")
+endif()
+if(NOT ROCR_TRAP_HANDLER_LLVM_OBJCOPY)
+  message(FATAL_ERROR "llvm-objcopy executable not found for trap-handler extraction")
+endif()
 
 set (TARGET_DEVS "gfx900;gfx942;gfx950;gfx1010;gfx1030;gfx1100;gfx1200")
 set (POSTFIX "9;942;950;1010;10;11;12")
 set (SOURCE_SUFFIX ";;;;;;_gfx12")
 
 if(${CMAKE_VERBOSE_MAKEFILE})
-  get_property(clang_path TARGET clang PROPERTY LOCATION)
-  get_property(objcopy_path TARGET llvm-objcopy PROPERTY LOCATION)
-  message("Using clang from: ${clang_path}")
-  message("Using llvm-objcopy from: ${objcopy_path}")
+  message("Using clang from: ${ROCR_TRAP_HANDLER_CLANG}")
+  message("Using llvm-objcopy from: ${ROCR_TRAP_HANDLER_LLVM_OBJCOPY}")
   message("Trap handlers assembled for: ${TARGET_DEVS}")
 endif()
 
@@ -69,8 +80,8 @@ function(gen_kernel_bc TARGET_ID INPUT_FILE OUTPUT_FILE)
   "-x assembler -target amdgcn-amd-amdhsa -mcpu=${TARGET_ID} -o ${CODE_OBJECT} ${INPUT_FILE}")
 
   ## Add custom command to produce a code object file.
-  add_custom_command(OUTPUT ${CODE_OBJECT} COMMAND clang ${CLANG_ARG_LIST}
-    DEPENDS ${INPUT_FILE} clang
+  add_custom_command(OUTPUT ${CODE_OBJECT} COMMAND ${ROCR_TRAP_HANDLER_CLANG} ${CLANG_ARG_LIST}
+    DEPENDS ${INPUT_FILE} ${ROCR_TRAP_HANDLER_CLANG}
     COMMENT "BUILDING bitcode for ${OUTPUT_FILE}..."
     VERBATIM)
 
@@ -78,8 +89,8 @@ function(gen_kernel_bc TARGET_ID INPUT_FILE OUTPUT_FILE)
 
   ## Extract .text segment
   add_custom_command(OUTPUT ${OUTPUT_FILE}
-                     COMMAND llvm-objcopy ${OBJCOPY_ARG_LIST}
-                     DEPENDS ${CODE_OBJECT} llvm-objcopy
+                     COMMAND ${ROCR_TRAP_HANDLER_LLVM_OBJCOPY} ${OBJCOPY_ARG_LIST}
+                     DEPENDS ${CODE_OBJECT} ${ROCR_TRAP_HANDLER_LLVM_OBJCOPY}
                      COMMENT "Extracting binary for ${OUTPUT_FILE}..."
                      VERBATIM)
 

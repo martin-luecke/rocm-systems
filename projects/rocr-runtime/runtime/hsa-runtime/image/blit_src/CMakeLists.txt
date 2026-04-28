@@ -42,8 +42,15 @@
 
 cmake_minimum_required ( VERSION 3.7 )
 
-# Import target 'clang'
-find_package(Clang REQUIRED HINTS ${CMAKE_PREFIX_PATH}/llvm PATHS /opt/rocm/llvm )
+# The blit source build only invokes clang as an executable.  Avoid importing
+# Clang's full CMake target graph so parent projects can choose their own LLVM
+# libraries independently.
+find_program(ROCR_IMAGE_BLIT_CLANG clang
+  HINTS ${CMAKE_PREFIX_PATH} /opt/rocm/llvm /opt/rocm
+  PATH_SUFFIXES bin)
+if(NOT ROCR_IMAGE_BLIT_CLANG)
+  message(FATAL_ERROR "clang executable not found for image blit assembly")
+endif()
 
 # Determine the target devices if not specified
 if (NOT DEFINED TARGET_DEVICES)
@@ -55,12 +62,11 @@ endif()
 set( TARGET_DEVICES ${TARGET_DEVICES} CACHE STRING "Build targets" FORCE )
 
 if(${CMAKE_VERBOSE_MAKEFILE})
-  get_property(clang_path TARGET clang PROPERTY LOCATION)
-  message("Using clang from: ${clang_path}")
+  message("Using clang from: ${ROCR_IMAGE_BLIT_CLANG}")
   message("Build Setting:")
   message("  Target Devices*: ${TARGET_DEVICES}")
   message("  (Specify \";\" separated list of target IDs.)")
-  message("       Clang path: ${clang_path}")
+  message("       Clang path: ${ROCR_IMAGE_BLIT_CLANG}")
 endif()
 
 ##==========================================
@@ -77,8 +83,8 @@ function(gen_kernel_bc TARGET_ID INPUT_FILE OUTPUT_FILE)
 
   ## Add custom command to produce a code object file.
   ## This depends on the kernel source file & compiler.
-  add_custom_command(OUTPUT ${OUTPUT_FILE} COMMAND clang ${CLANG_ARG_LIST}
-    DEPENDS ${INPUT_FILE} clang
+  add_custom_command(OUTPUT ${OUTPUT_FILE} COMMAND ${ROCR_IMAGE_BLIT_CLANG} ${CLANG_ARG_LIST}
+    DEPENDS ${INPUT_FILE} ${ROCR_IMAGE_BLIT_CLANG}
     COMMENT "BUILDING bitcode for ${OUTPUT_FILE}..."
     VERBATIM)
 
