@@ -23,7 +23,7 @@ buildSubtargetInfo(const Target &target, StringRef isa) {
   return sti;
 }
 
-bool initMCState(MCState &state, const std::string &targetISA) {
+bool initMCState(MCState &state, StringRef targetISA) {
   LLVMInitializeAMDGPUTargetInfo();
   LLVMInitializeAMDGPUTarget();
   LLVMInitializeAMDGPUTargetMC();

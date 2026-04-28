@@ -764,11 +764,11 @@ private:
 // ============================================================================
 
 static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
-                                 const std::string &sourceISA,
-                                 const std::string &kernelName,
+                                 llvm::StringRef sourceISA,
+                                 llvm::StringRef kernelName,
                                  const KernelMeta &meta,
                                  uint64_t kernelOffset,
-                                 const std::string &compilationTargetISA,
+                                 llvm::StringRef compilationTargetISA,
                                  bool enableWritelaneRewrite,
                                  bool enableWaveNative,
                                  bool forceThreadLoopProjection,
@@ -2520,11 +2520,11 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
 }
 
 RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
-                      const std::string &sourceISA,
-                      const std::string &kernelName,
+                      llvm::StringRef sourceISA,
+                      llvm::StringRef kernelName,
                       const KernelMeta &meta,
                       uint64_t kernelOffset,
-                      const std::string &compilationTargetISA,
+                      llvm::StringRef compilationTargetISA,
                       bool enableWritelaneRewrite,
                       bool enableWaveNative) {
   return raiseToIRImpl(textBytes, sourceISA, kernelName, meta, kernelOffset,
