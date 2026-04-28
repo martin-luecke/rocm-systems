@@ -130,6 +130,8 @@
 #include "SIDefines.h"
 #include "mc_state.hpp"
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/Support/raw_ostream.h"
@@ -138,8 +140,6 @@
 #include <deque>
 #include <optional>
 #include <set>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 using namespace llvm;
@@ -345,15 +345,17 @@ public:
   // any chain whose lowAddDone is false). Called when the analysis
   // observes any SGPR write that breaks the strict chain order.
   void dropInProgressChains() {
-    for (auto it = pcChains_.begin(); it != pcChains_.end();) {
-      if (!it->second.lowAddDone) {
-        intraDirtyHalf_.insert(it->first);
-        intraDirtyHalf_.insert(it->first + 1);
-        it = pcChains_.erase(it);
-      } else {
-        ++it;
+    // DenseMap::erase doesn't return an iterator; collect-then-erase.
+    llvm::SmallVector<unsigned> drop;
+    for (const auto &kv : pcChains_) {
+      if (!kv.second.lowAddDone) {
+        intraDirtyHalf_.insert(kv.first);
+        intraDirtyHalf_.insert(kv.first + 1);
+        drop.push_back(kv.first);
       }
     }
+    for (unsigned k : drop)
+      pcChains_.erase(k);
   }
 
   // Whether the block has performed any SGPR write to either half of
@@ -366,18 +368,18 @@ public:
 
   // Accessors used by Phase 2 to construct the per-block transfer
   // summary at end-of-block.
-  const std::unordered_map<unsigned, PcChain> &pcChains() const {
+  const llvm::DenseMap<unsigned, PcChain> &pcChains() const {
     return pcChains_;
   }
-  const std::unordered_set<unsigned> &dirtyHalves() const {
+  const llvm::DenseSet<unsigned> &dirtyHalves() const {
     return intraDirtyHalf_;
   }
 
 private:
   const MCRegisterInfo &MRI_;
-  std::unordered_map<unsigned, PcChain> pcChains_;
-  std::unordered_map<unsigned, ScalarImm> scalars_;
-  std::unordered_set<unsigned> intraDirtyHalf_;
+  llvm::DenseMap<unsigned, PcChain> pcChains_;
+  llvm::DenseMap<unsigned, ScalarImm> scalars_;
+  llvm::DenseSet<unsigned> intraDirtyHalf_;
 };
 
 // Mark every SGPR-half written by `di` as dirty in `state` and drop
@@ -426,7 +428,7 @@ struct BlockData {
   uint64_t offset = 0;
   size_t firstIdx = 0;
   size_t lastIdx = 0;
-  std::unordered_map<unsigned, PairTransfer> transfers;
+  llvm::DenseMap<unsigned, PairTransfer> transfers;
   SmallVector<uint64_t, 2> successors;
 };
 
@@ -603,7 +605,7 @@ SetPcAnalysis analyseSetPC(ArrayRef<DecodedInst> insts,
   // outside the decoded range).
   // ---------------------------------------------------------------
   std::vector<BlockData> blocks;
-  std::unordered_map<uint64_t, size_t> offsetToBlockIdx;
+  llvm::DenseMap<uint64_t, size_t> offsetToBlockIdx;
   blocks.reserve(mergedBlockStarts.size());
   for (size_t i = 0; i < insts.size(); ++i) {
     if (mergedBlockStarts.count(insts[i].offset)) {
@@ -1007,9 +1009,9 @@ SetPcAnalysis analyseSetPC(ArrayRef<DecodedInst> insts,
   // map and returns the exit-fact map. PASS pairs flow through; SET
   // and KILL pairs override.
   auto computeExit =
-      [&](const std::unordered_map<unsigned, PcLatticeValue> &entry,
+      [&](const llvm::DenseMap<unsigned, PcLatticeValue> &entry,
           const BlockData &bd) {
-        std::unordered_map<unsigned, PcLatticeValue> exit = entry;
+        llvm::DenseMap<unsigned, PcLatticeValue> exit = entry;
         for (const auto &kv : bd.transfers) {
           if (kv.second.kind == PairTransfer::Kind::Set) {
             PcLatticeValue v;
@@ -1025,7 +1027,7 @@ SetPcAnalysis analyseSetPC(ArrayRef<DecodedInst> insts,
         return exit;
       };
 
-  std::vector<std::unordered_map<unsigned, PcLatticeValue>> entryFacts(
+  std::vector<llvm::DenseMap<unsigned, PcLatticeValue>> entryFacts(
       blocks.size());
 
   std::deque<size_t> worklist;
@@ -1041,10 +1043,10 @@ SetPcAnalysis analyseSetPC(ArrayRef<DecodedInst> insts,
     onWorklist[bi] = false;
 
     // Recompute entry from JOIN over predecessors.
-    std::unordered_map<unsigned, PcLatticeValue> newEntry;
+    llvm::DenseMap<unsigned, PcLatticeValue> newEntry;
     if (!predecessors[bi].empty()) {
       // Collect predecessor exits.
-      std::vector<std::unordered_map<unsigned, PcLatticeValue>> predExits;
+      std::vector<llvm::DenseMap<unsigned, PcLatticeValue>> predExits;
       predExits.reserve(predecessors[bi].size());
       for (size_t pi : predecessors[bi])
         predExits.push_back(computeExit(entryFacts[pi], blocks[pi]));
@@ -1052,7 +1054,7 @@ SetPcAnalysis analyseSetPC(ArrayRef<DecodedInst> insts,
       // Determine the union of pairs mentioned by any predecessor
       // exit. These are the only pairs whose entry fact differs from
       // the unconstrained default at this block.
-      std::unordered_set<unsigned> mentioned;
+      llvm::DenseSet<unsigned> mentioned;
       for (const auto &pe : predExits)
         for (const auto &kv : pe)
           mentioned.insert(kv.first);
@@ -1160,12 +1162,12 @@ SetPcAnalysis analyseSetPC(ArrayRef<DecodedInst> insts,
   // ---------------------------------------------------------------
 
   // Collect Pattern B consumers.
-  std::set<unsigned> retPairsConsumedByB;
+  llvm::DenseSet<unsigned> retPairsConsumedByB;
   for (const PendingB &pb : pendingB)
     retPairsConsumedByB.insert(pb.retPairLowReg);
 
   // Collect DispatchSet consumers (pair → set of allowed values).
-  std::map<unsigned, std::set<uint64_t>> dispatchSetTargets;
+  llvm::DenseMap<unsigned, llvm::DenseSet<uint64_t>> dispatchSetTargets;
   for (const auto &kv : result.setpcSites) {
     if (kv.second.kind == SetPcSiteInfo::Kind::DispatchSet) {
       auto &set = dispatchSetTargets[kv.second.indirectRetPairLowReg];
@@ -1193,7 +1195,7 @@ SetPcAnalysis analyseSetPC(ArrayRef<DecodedInst> insts,
 
   // Build per-pair return-target lists for IndirectB from the
   // surviving terminators.
-  std::unordered_map<unsigned, SmallVector<uint64_t, 4>> targetsByPair;
+  llvm::DenseMap<unsigned, SmallVector<uint64_t, 4>> targetsByPair;
   for (const auto &kv : result.chainTerminators) {
     if (!retPairsConsumedByB.count(kv.second.retPairLowReg))
       continue;
