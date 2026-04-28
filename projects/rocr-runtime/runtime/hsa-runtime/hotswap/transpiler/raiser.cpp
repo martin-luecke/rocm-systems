@@ -506,45 +506,52 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
   auto *f32Ty = Type::getFloatTy(C);
   auto *ptrGlobalTy = PointerType::get(C, 1);
 
-  // Build function signature: a single opaque `[N x i8]` placeholder
-  // whose only job is to make the AMDGPU backend emit
-  // `kernarg_segment_size = N` in the lifted kernel's KD so the
-  // runtime's kernarg buffer reaches the kernel intact.
+  // Build function signature: a single opaque
+  // `ptr byref([N x i8]) align 16` placeholder whose only job is to
+  // make the AMDGPU backend emit `kernarg_segment_size = N` and
+  // `kernarg_segment_align = 16` in the lifted kernel's KD/metadata,
+  // so the runtime's kernarg buffer reaches the kernel intact and
+  // the metadata reports the AMDGPU ABI's 16-byte minimum.
   //
   // The handlers do NOT read this argument — kernarg loads lift to
   // GEP+load against `amdgcn_kernarg_segment_ptr` and let the AMDGPU
   // backend re-select `s_load_*` against the kernarg segment. The
   // typed source-ABI signature (ptr addrspace(1) / i32 / i64 / per-
-  // dword aggregate split, plus Mluecke's i8/i16 narrow-by-value
-  // arms) is therefore unnecessary on the lifted side; a single
-  // byte-array argument of the right total size produces the same
-  // kernarg buffer layout from the runtime's point of view.
+  // dword aggregate split) is therefore unnecessary on the lifted
+  // side.
   //
-  // Notes:
-  //  * Alignment: `[N x i8]` has ABI alignment 1, so the lifted KD
-  //    reports `kernarg_segment_alignment = 1`. Hosts allocate
-  //    kernarg buffers via the standard runtime allocator (16-byte
-  //    aligned in practice) and AMDGPU SMEM tolerates 4-byte-aligned
-  //    access on lower-alignment buffers, so this is benign on every
-  //    target the corpus exercises. If a future target rejects 1-byte
-  //    declared alignment, switch to `[ceil(N/4) x i32]` (alignment
-  //    4) at the cost of rounding `kernarg_segment_size` up to a
-  //    multiple of 4.
-  //  * AMDGPULowerKernelArguments skips load emission for arguments
-  //    that are `use_empty()` but still bumps the cumulative arg
-  //    offset, so the unused placeholder still contributes to
-  //    `kernarg_segment_size`.
+  // Why `byref` + `align`: AMDGPULowerKernelArguments consults the
+  // `align` parameter attribute only for byref kernel args (see
+  // `MaybeAlign ParamAlign = IsByRef ? Arg.getParamAlign() :
+  // std::nullopt;` in LLVM's `AMDGPULowerKernelArguments.cpp`). For
+  // a non-byref `[N x i8]` arg, the IR-level alignment is the
+  // type's natural alignment (1 byte), and the YAML metadata's
+  // `.kernarg_segment_align` field reports a smaller value than the
+  // ABI's 16-byte minimum. Using `byref` with an explicit
+  // `align(16)` lets the backend honour the alignment without
+  // forcing a vector or padding type, and the byref semantics —
+  // "pointer to an aggregate that's actually placed in the kernarg
+  // segment" — match the placeholder's intent: a stable region of
+  // `kernarg_segment_size` bytes that handlers don't need a typed
+  // view of.
+  //
+  // AMDGPULowerKernelArguments skips load emission for arguments
+  // that are `use_empty()` but still bumps the cumulative arg
+  // offset, so the unused placeholder still contributes to
+  // `kernarg_segment_size`.
   //
   // Test back-reference: every lit fixture under `lit_tests/` pins
   // either a `ptr addrspace(4)` GEP shape or an addrspace(1) global
   // GEP shape against the segment_ptr intrinsic — none of them rely
-  // on a typed Function argument list anymore.
+  // on the kernarg buffer being a typed Function argument list.
   SmallVector<Type *, 1> paramTypes;
   KernargLayout kernargs;
   int paramIdx = 0;
+  Type *kernargByrefTy = nullptr;
   if (meta.kernargSegmentSize > 0) {
-    paramTypes.push_back(
-        ArrayType::get(i8Ty, static_cast<uint64_t>(meta.kernargSegmentSize)));
+    kernargByrefTy =
+        ArrayType::get(i8Ty, static_cast<uint64_t>(meta.kernargSegmentSize));
+    paramTypes.push_back(PointerType::get(C, /*addrspace=*/4));
     paramIdx = 1;
   }
   kernargs.implicitArgsBase = meta.implicitArgsBase();
@@ -554,6 +561,16 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
   Function *F =
       Function::Create(funcTy, GlobalValue::ExternalLinkage, kernelName, &M);
   F->setCallingConv(CallingConv::AMDGPU_KERNEL);
+
+  // Attach `byref([N x i8])` + `align(16)` to the placeholder kernarg
+  // pointer. AMDGPULowerKernelArguments only honours param-align on
+  // byref kernel args, so this combo is what gets the lifted KD's
+  // kernarg-segment alignment to the AMDGPU ABI's 16-byte minimum
+  // without forcing an aggregate / vector type for the parameter.
+  if (kernargByrefTy != nullptr) {
+    F->addParamAttr(0, Attribute::getWithByRefType(C, kernargByrefTy));
+    F->addParamAttr(0, Attribute::getWithAlignment(C, Align(16)));
+  }
   {
     // Pin the workgroup size to exactly what the source kernel declared, so
     // the backend lays out LDS / workitem IDs the same way the original

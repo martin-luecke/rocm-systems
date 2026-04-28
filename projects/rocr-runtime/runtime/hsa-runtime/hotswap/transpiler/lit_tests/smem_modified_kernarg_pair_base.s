@@ -18,7 +18,7 @@
 ; vs VMEM from load uniformity at codegen time.
 
 ; CHECK-LABEL: define amdgpu_kernel void @smem_modified_kernarg_pair_base_kernel(
-; CHECK-SAME: [16 x i8] %kargs
+; CHECK-SAME: ptr addrspace(4) byref([16 x i8]) align 16 %kargs
 
 ; The preloaded input pointer is materialised via
 ; `amdgcn_kernarg_segment_ptr` (which always returns `ptr addrspace(4)`),

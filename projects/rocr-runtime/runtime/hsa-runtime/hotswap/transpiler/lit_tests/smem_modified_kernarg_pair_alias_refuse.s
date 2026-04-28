@@ -11,7 +11,7 @@
 ; codegen time without needing a lift-side addrspace hint.
 
 ; CHECK-LABEL: define amdgpu_kernel void @smem_modified_kernarg_pair_alias_refuse_kernel(
-; CHECK-SAME: [4 x i8] %kargs
+; CHECK-SAME: ptr addrspace(4) byref([4 x i8]) align 16 %kargs
 
 ; The entry kernarg pair is seeded from `amdgcn_kernarg_segment_ptr`
 ; (which always returns `ptr addrspace(4)`).
