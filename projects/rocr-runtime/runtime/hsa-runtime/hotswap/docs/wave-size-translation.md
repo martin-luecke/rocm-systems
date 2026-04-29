@@ -820,7 +820,7 @@ their handlers:
 | Canonical `s_bfe_u32 sDST, ttmp8, 0x50019` co-occurring with `v_writelane_b32` / `v_readlane_b32` **and** with a `v_wmma_*` op (C1) **when `--enable-writelane-rewrite` is OFF**. The §5.6.2 lift emits a per-lane divergent VGPR for `wave_id`, but the backend inserts an implicit `v_readfirstlane_b32` when that SGPR-shaped value feeds the cross-lane primitive's scalar source operand; the scalarisation erases the per-source-wave distinction and miscompiles every `wave_id`-keyed tile-column address. WMMA rules out the `ThreadLoopProjection` escape hatch (§5.2 wants the full target wave simultaneously). Under the flag, §5.6.3's Phase 6.5 rewrite replaces the divergent-feed cross-lane primitive with a principled `select` / `ds_bpermute` pair and the site graduates to the **Landed** table above. Pinned by `lit_tests/c1_wave_id_lift_scalarized` (REFUSE RUN line — the REWRITTEN RUN line pins the Landed path). | `WaveIdLiftScalarized` | `CrossWaveLaneIdLeak` |
 | `v_permlane64_b32` (C2). No wave32 analogue — a wave32 source can't meaningfully encode a 64-lane rotate. | `FullWaveRotate` | `CrossWaveUnrewritableShuffle` |
 | Non-commutative atomics (C3): `GLOBAL_ / FLAT_ / BUFFER_ATOMIC_{SWAP, CMPSWAP}`, `S_ATOMIC_SWAP`. Lanes `i` and `i + W_s` race on the same address; no rewrite preserves the single-participant invariant. | `NonCommutativeAtomic` | `CrossWaveReplicaRace` |
-| `v_cmpx` / `s_*_saveexec_b32` co-located with any `v_mbcnt_*` in the same kernel (C4). Syntactic over-approximation of "gating expression flows from an absolute lane id"; see §10. | `CmpxFromLaneId` / `SaveExecFromLaneId` | `CrossWaveLanePredicatedExec` |
+| `v_cmpx` / `s_*_saveexec_b32` whose predicate/mask is derived from `v_mbcnt_*` decoded-register provenance (C4). This catches absolute-lane-id EXEC gates while allowing unrelated `v_mbcnt_*` shuffle selectors plus ordinary bounds masks. | `CmpxFromLaneId` / `SaveExecFromLaneId` | `CrossWaveLanePredicatedExec` |
 | `llvm.amdgcn.workitem.id.x()` reaches an `icmp` against a compile-time constant `K` with `0 < K <= W_s - 1`, chain NOT AND-masked by `(W_s - 1)` first (C5). Lane-position-scoped predicate (scan-stage guards `tid >= 2^s`, half-wave broadcasts, quad-level masks) that partitions lanes by position within a single source wave and therefore diverges between MODREP's source-wave 0 and target replica-1. Post-mem2reg IR-level classifier in `c5_predicate_chain_classifier.{hpp,cpp}` (raiser.cpp Phase 6.6); produced ONLY by this classifier, never by `buildObstructionReport`'s MC walk. Narrow-O1-landed per hotswap/docs/modrep-predicate-chain.md §5 O1. Catches `canary_bpermute_scan_fp32` (Kogge-Stone K ∈ {1, 3, 7, 15}); does not catch `swiglu_fp32` / `corpus_layernorm_fp32` (icmp against a dynamic kernarg — different class per modrep-predicate-chain.md §6.4's orthogonal VOPD-cndmask / carry-chain fixes). | `WorkitemIdPredicateChain` | `CrossWavePredicateChain` |
 
 **Pending — structurally recognised, not yet lowered**
@@ -923,12 +923,13 @@ epic; not wave-size.
 
 ## 10. Known gaps (not regressions)
 
-1. **Classifier false-positive regime.** `CmpxFromLaneId` /
-   `SaveExecFromLaneId` flag via `mbcnt`-co-occurrence syntactically,
-   so a kernel that uses `v_mbcnt_*` for an unrelated purpose while
-   writing EXEC from something lane-position-independent refuses as a
-   false positive. Not exercised by any GPT-OSS kernel; the principled
-   fix is `TODO(dataflow-upgrade)` in `wave_size_obstruction.hpp`.
+1. **Classifier precision limit.** `CmpxFromLaneId` /
+   `SaveExecFromLaneId` now use decoded-register provenance rather than
+   kernel-wide `mbcnt` co-occurrence, so the known false-positive class
+   (`v_mbcnt_*` shuffle selector plus unrelated bounds EXEC) is closed.
+   A future IR-level dataflow pass can still refine cases that require
+   reasoning through memory, control-flow joins, or backend uniformity
+   facts beyond the decoded MC stream.
 2. **`s_setreg MODE` is dropped with a warning** (§5.5) rather than
    lowered to a real FP-mode change. Correct only for kernels whose
    downstream FP is mode-insensitive.
