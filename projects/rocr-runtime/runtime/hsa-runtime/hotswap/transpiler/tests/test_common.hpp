@@ -35,12 +35,40 @@ extern TestConfig g_config;
         << hipGetErrorString(_err) << ") at " << __FILE__ << ":" << __LINE__;  \
   } while (0)
 
-// Fixture for GPU tests.  TearDown resets the device so that a failure in one
-// test (e.g. hipError 700 / illegal address) does not cascade into subsequent
-// tests sharing the same process.
+// Fixture for GPU tests.  SetUp skips the test when no HIP-visible GPU is
+// present (so the suite can be run on machines without a GPU without spurious
+// failures).  TearDown resets the device so that a failure in one test (e.g.
+// hipError 700 / illegal address) does not cascade into subsequent tests
+// sharing the same process.
 class GpuTest : public ::testing::Test {
 protected:
-  void TearDown() override { (void)hipDeviceReset(); }
+  // Probe once per process: a missing/broken HIP runtime, no driver, or zero
+  // visible devices all collapse to "no GPU available". Cached so we do not
+  // re-probe (and re-emit driver-load warnings) for every test.
+  static bool gpuAvailable() {
+    static const bool available = []() {
+      int count = 0;
+      hipError_t err = hipGetDeviceCount(&count);
+      if (err != hipSuccess) {
+        // Drain the sticky last-error so it does not leak into the first real
+        // GPU test on a machine that does have a GPU.
+        (void)hipGetLastError();
+        return false;
+      }
+      return count > 0;
+    }();
+    return available;
+  }
+
+  void SetUp() override {
+    if (!gpuAvailable())
+      GTEST_SKIP() << "No HIP-visible GPU detected; skipping GPU test.";
+  }
+
+  void TearDown() override {
+    if (gpuAvailable())
+      (void)hipDeviceReset();
+  }
 };
 #endif
 
