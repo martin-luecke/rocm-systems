@@ -16,8 +16,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
-#include <fstream>
 #include <string>
+#include <system_error>
 
 #define DEBUG_TYPE "transpiler"
 
@@ -30,30 +30,36 @@ namespace transpiler {
 namespace {
 
 bool writeFile(llvm::StringRef path, llvm::StringRef contents) {
-  std::ofstream f(path.str());
-  if (!f.is_open()) {
-    llvm::errs() << "transpiler: Cannot write file: " << path << "\n";
+  std::error_code ec;
+  llvm::raw_fd_ostream f(path, ec);
+  if (ec) {
+    llvm::errs() << "transpiler: Cannot write file: " << path << ": "
+                 << ec.message() << "\n";
     return false;
   }
   f.write(contents.data(), contents.size());
-  f.flush();
-  if (!f) {
+  f.close();
+  if (f.has_error()) {
     llvm::errs() << "transpiler: write failed for: " << path << "\n";
+    f.clear_error();
     return false;
   }
   return true;
 }
 
 bool writeFile(llvm::StringRef path, llvm::ArrayRef<uint8_t> data) {
-  std::ofstream f(path.str(), std::ios::binary);
-  if (!f.is_open()) {
-    llvm::errs() << "transpiler: Cannot write file: " << path << "\n";
+  std::error_code ec;
+  llvm::raw_fd_ostream f(path, ec);
+  if (ec) {
+    llvm::errs() << "transpiler: Cannot write file: " << path << ": "
+                 << ec.message() << "\n";
     return false;
   }
   f.write(reinterpret_cast<const char *>(data.data()), data.size());
-  f.flush();
-  if (!f) {
+  f.close();
+  if (f.has_error()) {
     llvm::errs() << "transpiler: write failed for: " << path << "\n";
+    f.clear_error();
     return false;
   }
   return true;

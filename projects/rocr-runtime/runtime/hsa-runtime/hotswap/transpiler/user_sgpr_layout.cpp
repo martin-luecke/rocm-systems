@@ -6,8 +6,6 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <sstream>
-
 namespace transpiler {
 
 namespace {
@@ -259,7 +257,8 @@ UserSgprLayout UserSgprLayout::fromKernelMeta(const KernelMeta &meta,
 }
 
 std::string UserSgprLayout::toString() const {
-  std::ostringstream os;
+  std::string out;
+  llvm::raw_string_ostream os(out);
   os << "user_sgpr_count=" << static_cast<int>(userSgprCount);
   for (size_t i = 0; i < entries.size(); ++i) {
     const auto &e = entries[i];
@@ -269,7 +268,7 @@ std::string UserSgprLayout::toString() const {
     else if (e.subDword > 0)
       os << "[" << static_cast<int>(e.subDword) << "]";
   }
-  return os.str();
+  return out;
 }
 
 } // namespace transpiler
