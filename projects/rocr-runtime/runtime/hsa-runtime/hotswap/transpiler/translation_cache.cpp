@@ -157,7 +157,7 @@ void appendKeyField(std::string &material, llvm::StringRef name,
                     llvm::StringRef value) {
   material.append(name.data(), name.size());
   material.push_back('\0');
-  material += std::to_string(value.size());
+  material += llvm::Twine(value.size()).str();
   material.push_back(':');
   if (!value.empty())
     material.append(value.data(), value.size());
@@ -169,7 +169,7 @@ void appendKeyField(std::string &material, llvm::StringRef name, bool value) {
 }
 
 void appendKeyField(std::string &material, llvm::StringRef name, int value) {
-  appendKeyField(material, name, std::to_string(value));
+  appendKeyField(material, name, llvm::Twine(value).str());
 }
 
 const FileIdentity &llcIdentity() {
@@ -239,7 +239,7 @@ KeyData buildKeyData(const TranslationCacheRequest &request) {
                            request.sourceObject.end()));
 
   std::string material;
-  appendKeyField(material, "schema", std::to_string(kCacheSchemaVersion));
+  appendKeyField(material, "schema", kCacheSchemaVersion);
   appendKeyField(material, "source_sha256", data.sourceSha256);
   appendKeyField(material, "source_gfx", request.sourceGfx);
   appendKeyField(material, "target_gfx", request.targetGfx);

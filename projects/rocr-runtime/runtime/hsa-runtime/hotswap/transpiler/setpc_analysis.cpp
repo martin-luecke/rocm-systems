@@ -133,6 +133,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/Support/raw_ostream.h"
@@ -809,13 +810,13 @@ SetPcAnalysis analyseSetPC(ArrayRef<DecodedInst> insts,
           info.kind = SetPcSiteInfo::Kind::Unresolvable;
           info.refusalReason =
               ("s_swap_pc_i64 source SGPR pair s[" +
-               std::to_string(*srcLow) + ":" +
-               std::to_string(*srcLow + 1) +
+               Twine(*srcLow) + ":" +
+               Twine(*srcLow + 1) +
                "] was modified intra-block without producing a "
                "statically resolvable getpc+add chain (the block "
                "either started a chain that did not complete or "
                "overwrote the pair with a non-chain value); inter-"
-               "block dataflow facts cannot recover this");
+               "block dataflow facts cannot recover this").str();
           result.setpcSites[di.offset] = std::move(info);
         } else {
           // SrcPair is pristine through the block. Defer to Phase 4
@@ -1110,15 +1111,15 @@ SetPcAnalysis analyseSetPC(ArrayRef<DecodedInst> insts,
         info.kind = SetPcSiteInfo::Kind::Unresolvable;
         info.refusalReason =
             ("s_swap_pc_i64 source SGPR pair s[" +
-             std::to_string(pds.srcPair) + ":" +
-             std::to_string(pds.srcPair + 1) +
+             Twine(pds.srcPair) + ":" +
+             Twine(pds.srcPair + 1) +
              "] does not have a statically resolvable getpc+add "
              "chain reaching this site (intra-block analysis found "
              "no chain; inter-block dataflow could not enumerate a "
              "bounded set of targets — the value comes from a "
              "kernarg/runtime source, an unbounded fan-in, or a "
              "control-flow path that overwrites the pair with an "
-             "unmodelled value)");
+             "unmodelled value)").str();
         result.setpcSites[pds.siteOffset] = std::move(info);
       } else {
         // For s_set_pc_i64, fall through to PendingB — a subroutine-
@@ -1212,11 +1213,11 @@ SetPcAnalysis analyseSetPC(ArrayRef<DecodedInst> insts,
       info.kind = SetPcSiteInfo::Kind::Unresolvable;
       info.refusalReason =
           ("s_set_pc_i64 reads SGPR pair s[" +
-           std::to_string(pb.retPairLowReg) + ":" +
-           std::to_string(pb.retPairLowReg + 1) +
+           Twine(pb.retPairLowReg) + ":" +
+           Twine(pb.retPairLowReg + 1) +
            "] but no statically resolvable call-site getpc+add chain "
            "targets that pair (and inter-block dataflow could not "
-           "enumerate a bounded target set either)");
+           "enumerate a bounded target set either)").str();
       result.setpcSites[pb.setpcOffset] = std::move(info);
       continue;
     }

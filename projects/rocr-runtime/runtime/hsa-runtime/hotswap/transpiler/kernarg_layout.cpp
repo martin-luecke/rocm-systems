@@ -1,9 +1,10 @@
 #include "kernarg_layout.hpp"
 
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
-#include "llvm/ADT/StringRef.h"
 
 #include <algorithm>
 #include <string>
@@ -68,23 +69,18 @@ llvm::Value *extractKernargDword(const KernargLayout &layout,
         return B.CreateTrunc(B.CreateLShr(asI64, 32, "ka_hi_shr"), i32Ty,
                              "ka_hi");
       if (whyNot) {
-        *whyNot = "kernarg byte offset " + std::to_string(byteOffset) +
-                 " has unsupported sub-offset " + std::to_string(relOff) +
-                 " into 64-bit param idx " + std::to_string(p.paramIdx) +
-                 " (param byteOffset=" + std::to_string(p.byteOffset) +
-                 ", byteSize=" + std::to_string(p.byteSize) + ")";
+        *whyNot = ("kernarg byte offset " + Twine(byteOffset) + " has unsupported sub-offset " +
+            Twine(relOff) + " into 64-bit param idx " + Twine(p.paramIdx) +
+            " (param byteOffset=" + Twine(p.byteOffset) + ", byteSize=" + Twine(p.byteSize) + ")").str();
       }
       return nullptr;
     }
 
     if (p.byteOffset < byteOffset || pEnd > loadEnd) {
       if (whyNot) {
-        *whyNot = "kernarg byte offset " + std::to_string(byteOffset) +
-                 " partially overlaps param idx " +
-                 std::to_string(p.paramIdx) + " (param byteOffset=" +
-                 std::to_string(p.byteOffset) + ", byteSize=" +
-                 std::to_string(p.byteSize) +
-                 "); cross-dword scalar extraction is unsupported";
+        *whyNot = ("kernarg byte offset " + Twine(byteOffset) + " partially overlaps param idx " +
+            Twine(p.paramIdx) + " (param byteOffset=" + Twine(p.byteOffset) +
+            ", byteSize=" + Twine(p.byteSize) + "); cross-dword scalar extraction is unsupported").str();
       }
       return nullptr;
     }
@@ -98,10 +94,8 @@ llvm::Value *extractKernargDword(const KernargLayout &layout,
     if (argTy == i32Ty) {
       if (p.byteSize != 4) {
         if (whyNot) {
-          *whyNot = "kernarg byte offset " + std::to_string(byteOffset) +
-                   " hits i32 param idx " + std::to_string(p.paramIdx) +
-                   " with metadata byteSize=" + std::to_string(p.byteSize) +
-                   "; raiser bug";
+          *whyNot = ("kernarg byte offset " + Twine(byteOffset) + " hits i32 param idx " +
+              Twine(p.paramIdx) + " with metadata byteSize=" + Twine(p.byteSize) + "; raiser bug").str();
         }
         return nullptr;
       }
@@ -109,18 +103,18 @@ llvm::Value *extractKernargDword(const KernargLayout &layout,
     } else if (argTy->isIntegerTy(8) || argTy->isIntegerTy(16)) {
       if (argTy->getIntegerBitWidth() != widthBits) {
         if (whyNot) {
-          *whyNot = "kernarg byte offset " + std::to_string(byteOffset) +
-                   " hits narrow param idx " + std::to_string(p.paramIdx) +
-                   " with mismatched IR bit width";
+          *whyNot = ("kernarg byte offset " + Twine(byteOffset) +
+                    " hits narrow param idx " + Twine(p.paramIdx) +
+                    " with mismatched IR bit width").str();
         }
         return nullptr;
       }
       asI32 = B.CreateZExt(arg, i32Ty, "ka_narrow_zext");
     } else {
       if (whyNot) {
-        *whyNot = "kernarg byte offset " + std::to_string(byteOffset) +
-                 " hits param idx " + std::to_string(p.paramIdx) +
-                 " with unsupported IR arg type";
+        *whyNot = ("kernarg byte offset " + Twine(byteOffset) +
+                  " hits param idx " + Twine(p.paramIdx) +
+                  " with unsupported IR arg type").str();
       }
       return nullptr;
     }
@@ -170,11 +164,11 @@ llvm::Value *extractKernargDword(const KernargLayout &layout,
     int lastEnd = 0;
     for (auto &p : layout.params)
       lastEnd = std::max(lastEnd, p.byteOffset + p.byteSize);
-    *whyNot = "kernarg byte offset " + std::to_string(byteOffset) +
-             " is not covered by any explicit kernarg slot "
-             "(last named arg ends at " + std::to_string(lastEnd) +
-             ", kernarg_segment_size=" +
-             std::to_string(layout.kernargSegmentSize) + ")";
+    *whyNot = ("kernarg byte offset " + Twine(byteOffset) +
+              " is not covered by any explicit kernarg slot "
+              "(last named arg ends at " + Twine(lastEnd) +
+              ", kernarg_segment_size=" +
+              Twine(layout.kernargSegmentSize) + ")").str();
   }
   return nullptr;
 }
@@ -188,9 +182,9 @@ llvm::Value *extractKernargBytesAsI32(const KernargLayout &layout,
   Type *i32Ty = B.getInt32Ty();
   if (byteWidth != 1 && byteWidth != 2 && byteWidth != 4) {
     if (whyNot)
-      *whyNot = "unsupported kernarg byte load width " +
-                std::to_string(byteWidth) + " at byte offset " +
-                std::to_string(byteOffset);
+      *whyNot = ("unsupported kernarg byte load width " +
+                Twine(byteWidth) + " at byte offset " +
+                Twine(byteOffset)).str();
     return nullptr;
   }
 
@@ -204,10 +198,10 @@ llvm::Value *extractKernargBytesAsI32(const KernargLayout &layout,
     Value *dw = extractKernargDword(layout, B, F, dwordOffset, &dwordWhy);
     if (!dw) {
       if (whyNot) {
-        *whyNot = "failed to extract byte " + std::to_string(i) +
-                  " of " + std::to_string(byteWidth) +
+        *whyNot = ("failed to extract byte " + Twine(i) +
+                  " of " + Twine(byteWidth) +
                   " for kernarg byte load at offset " +
-                  std::to_string(byteOffset) + ": " + dwordWhy;
+                  Twine(byteOffset) + ": " + dwordWhy).str();
       }
       return nullptr;
     }

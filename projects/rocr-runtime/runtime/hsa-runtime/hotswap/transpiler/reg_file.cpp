@@ -76,7 +76,7 @@ void AllocaRegFile::init(IRBuilder<> &B, Type *i32Ty, Type *i1Ty,
   const unsigned nSGPR = MRI.getRegClass(AMDGPU::SGPR_32RegClassID).getNumRegs();
   sgpr.assign(nSGPR, nullptr);
   for (unsigned i = 0; i < nSGPR; ++i)
-    sgpr[i] = B.CreateAlloca(i32Ty, nullptr, "sgpr" + std::to_string(i));
+    sgpr[i] = B.CreateAlloca(i32Ty, nullptr, "sgpr" + Twine(i));
 
   // VGPR storage is explicitly oversized relative to TableGen's VGPR_32
   // class (see `kVGPRCap` docs in reg_file.hpp). AGPR storage mirrors
@@ -84,12 +84,12 @@ void AllocaRegFile::init(IRBuilder<> &B, Type *i32Ty, Type *i1Ty,
   // encoding conventions.
   vgpr.assign(kVGPRCap, nullptr);
   for (unsigned i = 0; i < kVGPRCap; ++i)
-    vgpr[i] = B.CreateAlloca(i32Ty, nullptr, "vgpr" + std::to_string(i));
+    vgpr[i] = B.CreateAlloca(i32Ty, nullptr, "vgpr" + Twine(i));
 
   if (isa.hasAGPR) {
     agpr.assign(kVGPRCap, nullptr);
     for (unsigned i = 0; i < kVGPRCap; ++i)
-      agpr[i] = B.CreateAlloca(i32Ty, nullptr, "agpr" + std::to_string(i));
+      agpr[i] = B.CreateAlloca(i32Ty, nullptr, "agpr" + Twine(i));
   }
 
   // Condition-carrying scalar registers are initialised to zero so that a
@@ -124,7 +124,7 @@ void AllocaRegFile::init(IRBuilder<> &B, Type *i32Ty, Type *i1Ty,
   const unsigned nTTMP = MRI.getRegClass(AMDGPU::TTMP_32RegClassID).getNumRegs();
   ttmp.assign(nTTMP, nullptr);
   for (unsigned i = 0; i < nTTMP; ++i)
-    ttmp[i] = B.CreateAlloca(i32Ty, nullptr, "ttmp" + std::to_string(i));
+    ttmp[i] = B.CreateAlloca(i32Ty, nullptr, "ttmp" + Twine(i));
 }
 
 void AllocaRegFile::storeSGPR32(IRBuilder<> &B, int idx, Value *v) {

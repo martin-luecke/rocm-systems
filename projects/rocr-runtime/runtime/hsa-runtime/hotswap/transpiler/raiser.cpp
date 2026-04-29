@@ -1247,7 +1247,7 @@ static RaiseResult raiseToIRImpl(llvm::ArrayRef<uint8_t> textBytes,
     // gfx1250 binary did.
     int maxWg = meta.maxFlatWorkgroupSize > 0 ? meta.maxFlatWorkgroupSize : 1024;
     F->addFnAttr("amdgpu-flat-work-group-size",
-                  std::to_string(maxWg) + "," + std::to_string(maxWg));
+                 (Twine(maxWg) + "," + Twine(maxWg)).str());
 
     // Deliberately do NOT set "amdgpu-waves-per-eu".  Pinning occupancy
     // constrains register allocation and caused spurious VGPR spills for
@@ -1308,12 +1308,13 @@ static RaiseResult raiseToIRImpl(llvm::ArrayRef<uint8_t> textBytes,
   // range.  The attribute takes "min,max" — we pass the same value
   // for both since the source's static size is known exactly.
   if (meta.groupSegmentFixedSize > 0) {
-    std::string sizeStr = std::to_string(meta.groupSegmentFixedSize);
-    F->addFnAttr("amdgpu-lds-size", sizeStr + "," + sizeStr);
+    F->addFnAttr("amdgpu-lds-size",
+                 (Twine(meta.groupSegmentFixedSize) + "," +
+                  Twine(meta.groupSegmentFixedSize)).str());
   }
 
   for (int i = 0; i < paramIdx; i++)
-    F->getArg(i)->setName("arg" + std::to_string(i));
+    F->getArg(i)->setName("arg" + Twine(i));
 
   errs() << "transpiler: Kernel '" << kernelName << "' has " << paramIdx
          << " args (kernarg_segment_size=" << meta.kernargSegmentSize << ")\n";
@@ -2181,9 +2182,9 @@ static RaiseResult raiseToIRImpl(llvm::ArrayRef<uint8_t> textBytes,
   ctx.sgprWaveMaskValidShadow.reserve(regs.sgpr.size());
   for (unsigned i = 0; i < regs.sgpr.size(); ++i) {
     auto *maskA = B.CreateAlloca(regs.execTy, nullptr,
-                                 "sgpr_mask_shadow_" + std::to_string(i));
+                                 "sgpr_mask_shadow_" + Twine(i));
     auto *validA = B.CreateAlloca(i1Ty, nullptr,
-                                  "sgpr_mask_valid_" + std::to_string(i));
+                                  "sgpr_mask_valid_" + Twine(i));
     B.CreateStore(ConstantInt::get(regs.execTy, 0), maskA);
     B.CreateStore(B.getFalse(), validA);
     ctx.sgprWaveMaskExecShadow.push_back(maskA);

@@ -11,6 +11,7 @@
 #include "llvm/Support/AMDHSAKernelDescriptor.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/Twine.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -430,7 +431,7 @@ PipelineResult runPipelineAllKernels(llvm::ArrayRef<uint8_t> codeObjectData,
   std::vector<std::string> objPaths;
   for (size_t i = 0; i < kernelNames.size(); ++i) {
     const auto &kName = kernelNames[i];
-    std::string objPath = tmpDir.filePath("k" + std::to_string(i) + ".o");
+    std::string objPath = tmpDir.filePath(("k" + llvm::Twine(i) + ".o").str());
 
     LLVM_DEBUG(llvm::dbgs() << "transpiler:   [" << (i + 1) << "/"
                             << kernelNames.size() << "] " << kName << " ... ");
