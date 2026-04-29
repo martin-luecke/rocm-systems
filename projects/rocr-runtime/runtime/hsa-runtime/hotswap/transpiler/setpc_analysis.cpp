@@ -486,7 +486,7 @@ void joinValue(PcLatticeValue &dst, const PcLatticeValue &src) {
   if (src.incomplete)
     dst.incomplete = true;
   for (uint64_t v : src.values) {
-    auto it = std::lower_bound(dst.values.begin(), dst.values.end(), v);
+    auto it = llvm::lower_bound(dst.values, v);
     if (it != dst.values.end() && *it == v)
       continue;
     if (dst.values.size() >= kMaxDispatchTargets) {
@@ -1197,10 +1197,9 @@ SetPcAnalysis analyseSetPC(ArrayRef<DecodedInst> insts,
         kv.second.resolvedReturnAddr);
     result.extraBlockStarts.insert(kv.second.resolvedReturnAddr);
   }
-  for (auto &kv : targetsByPair) {
-    auto &v = kv.second;
-    std::sort(v.begin(), v.end());
-    v.erase(std::unique(v.begin(), v.end()), v.end());
+  for (auto &v : llvm::make_second_range(targetsByPair)) {
+    llvm::sort(v);
+    v.erase(llvm::unique(v), v.end());
   }
 
   // Classify PendingB sites.
