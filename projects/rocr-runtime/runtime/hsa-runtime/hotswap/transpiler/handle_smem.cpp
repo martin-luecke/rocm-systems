@@ -15,30 +15,19 @@ namespace transpiler {
 namespace {
 
 // Look up the SGPR index that holds the *low* dword of the source-ISA
-// KernargSegmentPtr at kernel entry, via `ctx.userSgprLayout`.
+// KernargSegmentPtr at kernel entry, via `ctx.userSgprLayout`. The
+// kernarg pair slides off s[0:1] whenever earlier user-SGPR slots
+// (PrivateSegmentBuffer, DispatchPtr, QueuePtr, ...) are enabled, so
+// callers must consult the layout rather than hardcoding `baseIdx`.
 //
-// Used by the dword-granular S_LOAD_B* block and the narrow-SMEM
-// (S_LOAD_U8/I8/U16/I16) block to gate the implicit-args reroute on
-// "is this load's sbase the kernarg pair?" The previous implementation
-// hardcoded `baseIdx == 0`, which broke as soon as a kernel enabled
-// PrivateSegmentBuffer (4 dwords), DispatchPtr (2 dwords), or QueuePtr
-// (2 dwords) ahead of the kernarg pointer in the canonical
-// enable_sgpr_* order — the kernarg pair then slides up to s[2:3],
-// s[6:7], s[8:9], etc.
+// A null `userSgprLayout` is a wiring bug in the raiser (the layout
+// is populated by `UserSgprLayout::fromKernelMeta`, which itself
+// aborts loudly on a missing KD), so we surface it with
+// `report_fatal_error` rather than degrade.
 //
-// The layout object is the single source of truth for the source
-// ISA's user-SGPR ABI. It is populated by
-// `UserSgprLayout::fromKernelMeta` (which itself aborts loudly if the
-// kernel descriptor is missing, so we never fall back to a guessed
-// layout), and wired into `RaiseContext` before handler dispatch in
-// raiser.cpp. A null pointer here therefore means the raiser failed
-// to wire the layout into the context — a wiring bug, not a runtime
-// condition — and we surface it with `report_fatal_error`.
-//
-// Returns -1 if KernargSegmentPtr is disabled in the KD (no corpus
-// kernel today, but the caller must still guard against the `-1`
-// match to avoid a false-positive "is kernarg" on negative sbase
-// indices).
+// Returns -1 if KernargSegmentPtr is disabled in the KD; callers
+// must guard against the `-1` match to avoid a false-positive "is
+// kernarg" on negative sbase indices.
 int getKernargPtrSgpr(RaiseContext &ctx) {
   if (ctx.userSgprLayout == nullptr)
     llvm::report_fatal_error(
@@ -46,6 +35,61 @@ int getKernargPtrSgpr(RaiseContext &ctx) {
         "The raiser must populate this before dispatching to handlers; "
         "missing wiring is a bug.");
   return ctx.userSgprLayout->kernargSegmentPtrSgpr;
+}
+
+// AMDGPU separates the explicit kernarg segment from the implicit-arg
+// block: the latter is reachable via `amdgcn_implicitarg_ptr`, not
+// via offsets past the end of the kernarg segment. A source kernel
+// that issues `s_load_* sN, kernarg_pair, off` with
+// `off >= implicitArgsBase` is reading hidden args through the
+// source-ABI flat layout; the lifted kernel must materialise those
+// bytes via the implicit-arg pointer with the offset rebased to
+// `off - implicitArgsBase`. The same condition applies to every
+// load width (b32/b64/.../u8/i8/u16/i16).
+//
+// We deliberately do NOT track whether the kernarg pair has been
+// mutated since entry: corpus shapes that overwrite the pair
+// (Triton/SGLang `s[0:1] = preloaded_ptr + wg_offset`, Tensile
+// UniversalArgs `+16` shift) only issue follow-up loads at small
+// offsets that fall well below `implicitArgsBase`, so the literal
+// SGPR-index gate is precise enough in practice.
+bool isImplicitArgRerouteAccess(RaiseContext &ctx, const ParsedReg &base,
+                                 bool immOffset, int64_t byteOffset) {
+  int kernargPtrSgpr = getKernargPtrSgpr(ctx);
+  return base.kind == ParsedReg::SGPR && kernargPtrSgpr >= 0 &&
+         base.baseIdx == kernargPtrSgpr && immOffset &&
+         ctx.kernargs.implicitArgsBase > 0 &&
+         byteOffset >= ctx.kernargs.implicitArgsBase;
+}
+
+// In `HSA_SALMON_STRICT=1` the cross-arch implicit-arg layout is not
+// yet proven equivalent for every `(source ISA, target ISA)` pair we
+// lift between, so the pipeline refuses to silently substitute a
+// target-ABI implicit arg for a source-ABI one. In permissive mode
+// we trust the ROCm convention that the layouts match (both gfx9-12
+// follow the same `hidden_*` block).
+RaiseFailure implicitArgStrictRefusal(const DecodedInst &di) {
+  return RaiseFailure::strictUnsafeLowering(
+      di, "implicitarg.ptr",
+      "cross-arch implicitarg.ptr lowering is unresolved: source "
+      "implicit-arg offsets are being applied to the target runtime "
+      "hidden-arg block");
+}
+
+// Materialise the rebased pointer (addrspace(4) i8*) into the
+// target's implicit-arg block. Caller must have already checked
+// `isImplicitArgRerouteAccess` and strict mode.
+llvm::Value *buildImplicitArgPtr(RaiseContext &ctx, int64_t byteOffset) {
+  llvm::Function *fnImplicitArgPtr = llvm::Intrinsic::getOrInsertDeclaration(
+      &ctx.M, llvm::Intrinsic::amdgcn_implicitarg_ptr);
+  llvm::Value *implPtr =
+      ctx.B.CreateCall(fnImplicitArgPtr, {}, "implicitarg_ptr");
+  int64_t implOffset = byteOffset - ctx.kernargs.implicitArgsBase;
+  return implOffset == 0
+             ? implPtr
+             : ctx.B.CreateInBoundsGEP(ctx.i8Ty, implPtr,
+                                        ctx.B.getInt64(implOffset),
+                                        "impl_gep");
 }
 
 } // namespace
@@ -89,58 +133,14 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
     unsigned offIdx = op.srcIdx(1);
     bool immOffset = di.isImm(offIdx);
     int64_t byteOffset = immOffset ? op.srcImm(1) : 0;
-    int kernargPtrSgpr = getKernargPtrSgpr(ctx);
-    bool baseIsKernargPair =
-        (base.kind == ParsedReg::SGPR && kernargPtrSgpr >= 0 &&
-         base.baseIdx == kernargPtrSgpr);
 
-    // Implicit-args reroute. AMDGPU separates the explicit kernarg
-    // segment from the implicit-arg block: the latter is reachable via
-    // `amdgcn_implicitarg_ptr`, not via offsets past the end of the
-    // kernarg segment. A source kernel that issues
-    // `s_load_b* sN, kernarg_pair, off` with `off >= implicitArgsBase`
-    // is reading hidden args through the source-ABI flat layout; the
-    // lifted kernel must materialise those bytes via the implicit-arg
-    // pointer with the offset rebased to `off - implicitArgsBase`.
-    //
-    // Strict-mode refusal: in `HSA_SALMON_STRICT=1` the cross-arch
-    // implicit-arg layout is not yet proven equivalent for every
-    // `(source ISA, target ISA)` pair we lift between, so the
-    // pipeline refuses to silently substitute a target-ABI implicit
-    // arg for a source-ABI one. In permissive mode we trust the
-    // ROCm convention that the layouts match (both gfx9-12 follow
-    // the same `hidden_*` block).
-    //
-    // Gating: `baseIsKernargPair` (literal SGPR-index match against
-    // the source-ABI kernarg pair) + `immOffset` + a positive
-    // `implicitArgsBase`. We deliberately do NOT track whether the
-    // pair has been mutated since entry: corpus shapes that overwrite
-    // the pair (Triton/SGLang `s[0:1] = preloaded_ptr + wg_offset`,
-    // Tensile UniversalArgs `+16` shift) only issue follow-up loads at
-    // small offsets that fall well below `implicitArgsBase`, so the
-    // gate is precise enough in practice.
-    if (baseIsKernargPair && immOffset &&
-        ctx.kernargs.implicitArgsBase > 0 &&
-        byteOffset >= ctx.kernargs.implicitArgsBase) {
+    // See `isImplicitArgRerouteAccess` for the rationale.
+    if (isImplicitArgRerouteAccess(ctx, base, immOffset, byteOffset)) {
       if (isStrictMode()) {
-        hr.failure = RaiseFailure::strictUnsafeLowering(
-            di, "implicitarg.ptr",
-            "cross-arch implicitarg.ptr lowering is unresolved: source "
-            "implicit-arg offsets are being applied to the target runtime "
-            "hidden-arg block");
+        hr.failure = implicitArgStrictRefusal(di);
         return hr;
       }
-      Function *fnImplicitArgPtr = Intrinsic::getOrInsertDeclaration(
-          &ctx.M, Intrinsic::amdgcn_implicitarg_ptr);
-      Value *implPtr =
-          ctx.B.CreateCall(fnImplicitArgPtr, {}, "implicitarg_ptr");
-      int64_t implOffset = byteOffset - ctx.kernargs.implicitArgsBase;
-      Value *gep =
-          (implOffset == 0)
-              ? implPtr
-              : ctx.B.CreateInBoundsGEP(ctx.i8Ty, implPtr,
-                                         ctx.B.getInt64(implOffset),
-                                         "impl_gep");
+      Value *gep = buildImplicitArgPtr(ctx, byteOffset);
       for (int d = 0; d < loadDwords; d++) {
         Value *ep = (d == 0) ? gep
                              : ctx.B.CreateInBoundsGEP(
@@ -237,24 +237,36 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
     ParsedReg dest = op.dst();
     ParsedReg base = op.srcReg(0);
 
-    Value *baseAddr = ctx.regs.loadSGPR64(ctx.B, base.baseIdx);
-    Value *ptr = ctx.B.CreateIntToPtr(baseAddr, ctx.ptrGlobalTy);
     unsigned offIdx = op.srcIdx(1);
-    if (di.isImm(offIdx)) {
-      int64_t off = op.srcImm(1);
-      if (off != 0)
-        ptr = ctx.B.CreateInBoundsGEP(ctx.i8Ty, ptr, ctx.B.getInt64(off));
+    bool immOffset = di.isImm(offIdx);
+    int64_t byteOffset = immOffset ? op.srcImm(1) : 0;
+
+    Value *ptr = nullptr;
+    if (isImplicitArgRerouteAccess(ctx, base, immOffset, byteOffset)) {
+      if (isStrictMode()) {
+        hr.failure = implicitArgStrictRefusal(di);
+        return hr;
+      }
+      ptr = buildImplicitArgPtr(ctx, byteOffset);
     } else {
-      // Narrow SMEM element size for `scale_offset`: 1B for byte,
-      // 2B for halfword. Same SCAL-scales-the-SGPR-offset rule as
-      // the dword family above.
-      int narrowBytes = isHalfWord ? 2 : 1;
-      Value *regOff = ctx.B.CreateZExt(op.src(1), ctx.i64Ty, "smem_nroff");
-      if (di.hasScaleOffset && narrowBytes != 1)
-        regOff = ctx.B.CreateMul(regOff,
-                                 ConstantInt::get(ctx.i64Ty, narrowBytes),
-                                 "smem_nroff_scaled");
-      ptr = ctx.B.CreateInBoundsGEP(ctx.i8Ty, ptr, regOff);
+      Value *baseAddr = ctx.regs.loadSGPR64(ctx.B, base.baseIdx);
+      ptr = ctx.B.CreateIntToPtr(baseAddr, ctx.ptrGlobalTy);
+      if (immOffset) {
+        if (byteOffset != 0)
+          ptr = ctx.B.CreateInBoundsGEP(ctx.i8Ty, ptr,
+                                         ctx.B.getInt64(byteOffset));
+      } else {
+        // Narrow SMEM element size for `scale_offset`: 1B for byte,
+        // 2B for halfword. Same SCAL-scales-the-SGPR-offset rule as
+        // the dword family above.
+        int narrowBytes = isHalfWord ? 2 : 1;
+        Value *regOff = ctx.B.CreateZExt(op.src(1), ctx.i64Ty, "smem_nroff");
+        if (di.hasScaleOffset && narrowBytes != 1)
+          regOff = ctx.B.CreateMul(regOff,
+                                   ConstantInt::get(ctx.i64Ty, narrowBytes),
+                                   "smem_nroff_scaled");
+        ptr = ctx.B.CreateInBoundsGEP(ctx.i8Ty, ptr, regOff);
+      }
     }
 
     Value *narrow = ctx.B.CreateAlignedLoad(narrowTy, ptr, narrowAlign,
