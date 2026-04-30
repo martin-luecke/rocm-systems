@@ -1,6 +1,6 @@
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
 ; RUN:   && %raise_cli %t.hsaco --target-isa=gfx942 \
-; RUN:     --emit-ir=smem_modified_kernarg_pair_alias_refuse_kernel 2>&1 \
+; RUN:     --emit-ir=smem_modified_kernarg_pair_alias_kernel 2>&1 \
 ; RUN:   | %FileCheck %s
 ;
 ; Companion to `smem_modified_kernarg_pair_base.s` covering the
@@ -10,7 +10,7 @@
 ; backend's lowering picks SMEM vs VMEM from load uniformity at
 ; codegen time without needing a lift-side addrspace hint.
 
-; CHECK-LABEL: define amdgpu_kernel void @smem_modified_kernarg_pair_alias_refuse_kernel(
+; CHECK-LABEL: define amdgpu_kernel void @smem_modified_kernarg_pair_alias_kernel(
 ; CHECK-SAME: ptr addrspace(4) byref([4 x i8]) align 16 %kargs
 
 ; The entry kernarg pair is seeded from `amdgcn_kernarg_segment_ptr`
@@ -23,10 +23,10 @@
 	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
 	.amdhsa_code_object_version 6
 	.text
-	.globl	smem_modified_kernarg_pair_alias_refuse_kernel
+	.globl	smem_modified_kernarg_pair_alias_kernel
 	.p2align	8
-	.type	smem_modified_kernarg_pair_alias_refuse_kernel,@function
-smem_modified_kernarg_pair_alias_refuse_kernel:
+	.type	smem_modified_kernarg_pair_alias_kernel,@function
+smem_modified_kernarg_pair_alias_kernel:
 ; %bb.0:
 	s_mov_b64 s[12:13], s[0:1]
 	s_mov_b64 s[6:7], 0
@@ -36,7 +36,7 @@ smem_modified_kernarg_pair_alias_refuse_kernel:
 	s_endpgm
 	.section	.rodata,"a",@progbits
 	.p2align	6, 0x0
-	.amdhsa_kernel smem_modified_kernarg_pair_alias_refuse_kernel
+	.amdhsa_kernel smem_modified_kernarg_pair_alias_kernel
 		.amdhsa_group_segment_fixed_size 0
 		.amdhsa_private_segment_fixed_size 0
 		.amdhsa_kernarg_size 4
@@ -61,10 +61,10 @@ amdhsa.kernels:
     .kernarg_segment_align: 8
     .kernarg_segment_size: 4
     .max_flat_workgroup_size: 1024
-    .name: smem_modified_kernarg_pair_alias_refuse_kernel
+    .name: smem_modified_kernarg_pair_alias_kernel
     .private_segment_fixed_size: 0
     .sgpr_count: 14
-    .symbol: smem_modified_kernarg_pair_alias_refuse_kernel.kd
+    .symbol: smem_modified_kernarg_pair_alias_kernel.kd
     .vgpr_count: 1
     .wavefront_size: 32
 amdhsa.target: amdgcn-amd-amdhsa--gfx1250
