@@ -278,10 +278,12 @@ set(HOTSWAP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/..")
 set(AITER_CORPUS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../kernels/aiter_gfx950")
 set(SCOPE_DISCOVERY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/scope_discovery/kernels")
 set(GFX1250_TEST_DATA "${CMAKE_CURRENT_SOURCE_DIR}/../test_data/gfx1250")
+set(BF16_TENSILE_DATA "${CMAKE_CURRENT_SOURCE_DIR}/tests/bf16_small_out")
 
 set(TEST_SOURCES
   tests/test_main.cpp
   tests/batch_raise_test.cpp
+  tests/bf16_tensile_test.cpp
   tests/corpus_test.cpp
   tests/c5_predicate_chain_test.cpp
   tests/kernarg_layout_test.cpp
@@ -324,6 +326,7 @@ target_compile_definitions(transpiler_tests PRIVATE
   AITER_CORPUS_DIR="${AITER_CORPUS_DIR}"
   SCOPE_DISCOVERY_DIR="${SCOPE_DISCOVERY_DIR}"
   LLVM_TOOLS_DIR="${LLVM_TOOLS_BINARY_DIR}"
+  BF16_TENSILE_DATA_DIR="${BF16_TENSILE_DATA}"
 )
 
 if(hip_FOUND)
