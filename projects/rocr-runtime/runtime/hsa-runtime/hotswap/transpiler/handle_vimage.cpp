@@ -56,12 +56,17 @@
 //
 // We provide functional emulation by linking a HIP-authored device
 // runtime (`runtime/tdm.hip`) into the raised IR module. The handler
-// emits a call to `salmon_tdm_load_to_lds` / `salmon_tdm_store_from_lds`
-// with the same operand vectors the same-target intrinsic emit
-// produces, plus the source wave size; the link merge happens in
-// `raiseToIR` (see `tdm_runtime.hpp` and `raiser.cpp`). The helper
-// stripes the descriptor's innermost X dimension across source-wave-local
-// lanes and implements the full D# walk (4D/5D loops, OOB rules, padding,
+// emits one helper call (`salmon_tdm_load_to_lds` /
+// `salmon_tdm_store_from_lds`) per emulated source wave packed into the
+// target hardware wave, via `RaiseContext::emitPerSourceWave`. Each call
+// receives descriptors that have been broadcast to be uniform across all
+// hardware lanes (via `@llvm.amdgcn.readlane(elem, groupBase)`) and is
+// told to stripe its X-loop across `targetWaveSize` lanes. Under
+// WaveNativeProjection's wave32 -> wave64 packing this means two
+// sequential helper calls per TDM instruction, each running with all 64
+// target lanes participating in the descriptor walk. The link merge
+// happens in `raiseToIR` (see `tdm_runtime.hpp` and `raiser.cpp`); the
+// helper implements the full D# walk (4D/5D loops, OOB rules, padding,
 // iteration, gather mode, atomic-barrier side effect).
 //
 // When the transpiler was built without hipcc, `tdmRuntimeAvailable()`
@@ -118,6 +123,51 @@ Value *marshalSgprGroup(RaiseContext &ctx, ParsedReg base, unsigned n,
 Value *zeroVec(RaiseContext &ctx, unsigned n) {
   auto *vecTy = FixedVectorType::get(ctx.i32Ty, n);
   return ConstantAggregateZero::get(vecTy);
+}
+
+// Broadcast each i32 element of a `<N x i32>` descriptor vector across all
+// hardware lanes by reading from a specific source lane via
+// `@llvm.amdgcn.ds.bpermute`.
+//
+// Used by the cross-target TDM lowering when WaveNativeProjection packs two
+// source wave32s into one target wave64: we want each per-source-wave TDM
+// runtime call to see uniform descriptors so the helper's inner
+// `readfirstlane` becomes a no-op and its X-loop stripes across all 64
+// hardware lanes.
+//
+// `laneIdx` is the absolute target-wave lane (0 for source wave 0, 32 for
+// source wave 1 under WaveNative). `vec` is a `<N x i32>` whose lane K
+// holds the SGPR dword K-th-element of the descriptor in the original
+// source-wave coordinate system. The result is a `<N x i32>` where every
+// hardware lane sees the same broadcast value.
+//
+// Why `ds.bpermute` rather than `amdgcn.readlane`: under WaveNative
+// cross-widening, the post-mem2reg `rewriteCrossLaneDivergent` pass
+// rewrites every `amdgcn.readlane` into a source-wave-scoped
+// `ds.bpermute` whose selector is `((lane_id & ~(W_s-1)) | laneIdx) << 2`
+// — i.e. each source-wave's lanes read from their OWN source wave's
+// laneIdx, not from the absolute laneIdx we want. That rewrite is
+// correct for raising a source-emitted `v_readlane_b32` (which is
+// source-wave-scoped by definition) but is exactly the wrong semantics
+// for the cross-source-wave broadcast we need here. Emitting
+// `ds.bpermute` with a wave-uniform selector directly bypasses that
+// rewrite and gives us the absolute-lane broadcast the runtime needs.
+Value *broadcastVecFromLane(RaiseContext &ctx, Value *vec, unsigned laneIdx,
+                            const Twine &name) {
+  auto *vecTy = cast<FixedVectorType>(vec->getType());
+  const unsigned n = vecTy->getNumElements();
+  Function *bpermute = Intrinsic::getOrInsertDeclaration(
+      &ctx.M, Intrinsic::amdgcn_ds_bpermute);
+  // ds_bpermute selector is byte-addressed (lane index << 2). A uniform
+  // selector means every lane reads from the same source lane.
+  Value *selector = ConstantInt::get(ctx.i32Ty, laneIdx * 4);
+  Value *out = PoisonValue::get(vecTy);
+  for (unsigned i = 0; i < n; ++i) {
+    Value *elem = ctx.B.CreateExtractElement(vec, i);
+    Value *uni = ctx.B.CreateCall(bpermute, {selector, elem});
+    out = ctx.B.CreateInsertElement(out, uni, i, name);
+  }
+  return out;
 }
 
 // Read an immediate operand and zero-extend it to i32. The intrinsic
@@ -292,18 +342,33 @@ HandlerResult handleVIMAGE(RaiseContext &ctx, const DecodedInst &di,
   FunctionCallee helper = (sop == SemOp::TENSOR_LOAD_TO_LDS)
                               ? declareTDMLoad(ctx.M)
                               : declareTDMStore(ctx.M);
-  // The runtime helper's signature is the four D# groups plus the source
-  // wave size. It deliberately does NOT take the intrinsic's trailing
-  // `<8 x i32> grp4` because that group is reserved by the gfx1250
-  // intrinsic contract, and it does not take `i32 cpol` because the
-  // cross-target helper has no target cache-policy encoding to preserve.
-  // The descriptor-visible side effects, including atomic-barrier updates,
-  // live in the D# groups that are forwarded. `sourceWaveSize` keeps the
-  // helper's descriptor readfirstlane / X stripe source-wave-local when
-  // WaveNativeProjection packs two source wave32s into one target wave64.
-  ctx.emitUnderExec([&] {
-    ctx.B.CreateCall(helper, {args.grp0, args.grp1, args.grp2, args.grp3,
-                              ctx.B.getInt32(sourceWaveSize)});
+  // Per-source-wave emission. Under WaveNativeProjection's wave32 -> wave64
+  // packing, two emulated source waves share one hardware wave (source wave
+  // 0 -> target lanes 0..31, source wave 1 -> target lanes 32..63). We
+  // issue one TDM helper call per source wave with descriptors that are
+  // already uniform across all 64 target lanes (broadcast from the
+  // source-wave's first lane via `@llvm.amdgcn.readlane`) and tell the
+  // helper to stripe its X-loop across the *target* wave size.
+  //
+  // Net effect compared to the prior single-call shape:
+  //   * the helper's inner `readfirstlane` collapses to identity (the
+  //     descriptor is already wave-uniform),
+  //   * the X stripe runs across 64 lanes (vs 32 lanes per half-wave under
+  //     the old runtime-side branch-on-lane split), so each TDM op gets
+  //     full hardware-wave bandwidth instead of half,
+  //   * the runtime no longer needs to discover the wave32-in-wave64 case;
+  //     `tdm.hip:dispatch()` now traps on any cross-wave shape.
+  //
+  // The two calls are ordered (source wave 0 first), and each is gated on
+  // its own EXEC half via `emitPerSourceWave`, so a source wave that was
+  // killed (EXEC=0 across its lanes) does not issue a runtime call.
+  ctx.emitPerSourceWave([&](unsigned groupBase) {
+    Value *uni0 = broadcastVecFromLane(ctx, args.grp0, groupBase, "td_uni_grp0");
+    Value *uni1 = broadcastVecFromLane(ctx, args.grp1, groupBase, "td_uni_grp1");
+    Value *uni2 = broadcastVecFromLane(ctx, args.grp2, groupBase, "td_uni_grp2");
+    Value *uni3 = broadcastVecFromLane(ctx, args.grp3, groupBase, "td_uni_grp3");
+    ctx.B.CreateCall(helper, {uni0, uni1, uni2, uni3,
+                              ctx.B.getInt32(targetWaveSize)});
   });
   hr.handled = true;
   return hr;

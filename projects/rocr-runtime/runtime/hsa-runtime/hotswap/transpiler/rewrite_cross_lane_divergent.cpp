@@ -1,5 +1,7 @@
 #include "rewrite_cross_lane_divergent.hpp"
 
+#include "tdm_runtime.hpp" // kTDMLoadSymbol / kTDMStoreSymbol — VGPR-safe sinks
+
 #include "SIDefines.h" // llvm::AMDGPU::DPP::DppCtrl
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -400,8 +402,27 @@ IntrinsicRole classifyIntrinsicUse(CallBase *CB, Value *V,
     return IntrinsicRole::SGPRForced; // indirect / unresolved
 
   Intrinsic::ID id = callee->getIntrinsicID();
-  if (id == Intrinsic::not_intrinsic)
+  if (id == Intrinsic::not_intrinsic) {
+    // Known-safe ordinary calls. The TDM runtime helpers
+    // (`salmon_tdm_load_to_lds` / `salmon_tdm_store_from_lds`,
+    // declared in `tdm_runtime.hpp` and link-merged from
+    // `runtime/tdm.hip`) are explicitly designed to accept
+    // descriptors that may be divergent across the wave: their
+    // very first action on the descriptor is `readfirstlane`.
+    // The transpiler also emits these calls with descriptors that
+    // have already been broadcast across the wave via
+    // `@llvm.amdgcn.readlane(elem, groupBase)` (see
+    // `handle_vimage.cpp:broadcastVecFromLane`), so the safety
+    // net's worry — that an SGPR-forced consumer would
+    // re-introduce `v_readfirstlane` at the boundary and recreate
+    // the source-wave collapse — does not apply here. The values
+    // arriving at the call site are already wave-uniform by
+    // construction.
+    StringRef name = callee->getName();
+    if (name == kTDMLoadSymbol || name == kTDMStoreSymbol)
+      return IntrinsicRole::VGPRSafeSink;
     return IntrinsicRole::SGPRForced; // ordinary call — unknown
+  }
 
   if (operandForcesSGPR(id, operandIdx))
     return IntrinsicRole::SGPRForced;

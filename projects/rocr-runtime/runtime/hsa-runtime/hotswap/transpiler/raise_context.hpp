@@ -574,6 +574,37 @@ struct RaiseContext {
   // topologically the "after" of the wrapped op, exactly like before).
   void emitUnderExec(llvm::function_ref<void()> body);
 
+  // emitPerSourceWave(body) calls `body(groupBase)` once for each emulated
+  // source wave packed into the target wave, gating each call on whether
+  // any lane of that source wave is active in the current EXEC alloca.
+  //
+  // Layout:
+  //
+  //   numSourceWavesPerTarget() == 1 (same-wave / MODREP):
+  //     issues one call with groupBase = 0; the predicate degenerates to
+  //     "any lane in the wave is active".
+  //
+  //   numSourceWavesPerTarget() == 2 (WaveNative wave32 → wave64):
+  //     issues two calls with groupBase = 0 then 32; each predicated on
+  //     the corresponding 32-bit half of the widened EXEC being non-zero.
+  //
+  // The predicate for source wave w is computed as
+  //
+  //   anyActive = ((exec >> (w * isa.waveSize)) & ((1 << isa.waveSize) - 1)) != 0
+  //
+  // Each pass is then wrapped in an `if (anyActive)` diamond, mirroring the
+  // shape of `emitUnderExec` but without the per-lane convergent semantics —
+  // the body is expected to be uniform across all hardware lanes of the
+  // target wave (e.g. a TDM helper call invoked with descriptors broadcast
+  // via `@llvm.amdgcn.readlane(elem, groupBase)`).
+  //
+  // Side-effect ordering between source waves matches the loop order: source
+  // wave 0 first, then source wave 1, etc. Memory dependencies between the
+  // two waves' descriptors (e.g. atomic-barrier updates in the TDM runtime)
+  // are sequenced by the IR order of the calls.
+  void emitPerSourceWave(
+      llvm::function_ref<void(unsigned groupBase)> body);
+
   // Memoised lane_active for this instruction's emission. Kept as public
   // members (rather than `private:`) so RaiseContext remains an aggregate
   // and can be brace-initialised from the raiser. Mutate only via

@@ -614,6 +614,44 @@ void RaiseContext::emitUnderExec(llvm::function_ref<void()> body) {
   B.SetInsertPoint(skipBB);
 }
 
+void RaiseContext::emitPerSourceWave(
+    llvm::function_ref<void(unsigned groupBase)> body) {
+  const unsigned numWaves = projection.numSourceWavesPerTarget();
+  const unsigned srcWaveSize = isa.waveSize;
+  Type *execTy = regs.execTy;
+  const unsigned execBits = execTy->getPrimitiveSizeInBits();
+
+  for (unsigned w = 0; w < numWaves; ++w) {
+    const unsigned groupBase = w * srcWaveSize;
+    Function *F = B.GetInsertBlock()->getParent();
+    BasicBlock *doBB = BasicBlock::Create(C, "psw_do", F);
+    BasicBlock *skipBB = BasicBlock::Create(C, "psw_skip", F);
+
+    Value *exec = regs.loadExec(B);
+    Value *halfBits = exec;
+    if (groupBase != 0)
+      halfBits = B.CreateLShr(halfBits, ConstantInt::get(execTy, groupBase),
+                              "psw_exec_shr");
+    if (srcWaveSize < execBits) {
+      const uint64_t maskVal =
+          (srcWaveSize >= 64) ? ~uint64_t(0)
+                              : ((uint64_t(1) << srcWaveSize) - 1);
+      halfBits = B.CreateAnd(halfBits, ConstantInt::get(execTy, maskVal),
+                             "psw_exec_mask");
+    }
+    Value *anyActive = B.CreateICmpNE(
+        halfBits, ConstantInt::get(execTy, 0), "psw_any_active");
+    B.CreateCondBr(anyActive, doBB, skipBB);
+
+    B.SetInsertPoint(doBB);
+    body(groupBase);
+    if (!B.GetInsertBlock()->hasTerminator())
+      B.CreateBr(skipBB);
+
+    B.SetInsertPoint(skipBB);
+  }
+}
+
 
 Value *RaiseContext::readOpExecWidth(const DecodedInst &di, unsigned opIdx) {
   // All callers expect the returned value at `regs.execTy` (the EXEC
