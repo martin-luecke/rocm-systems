@@ -57,6 +57,7 @@
 #include <sstream>
 #include <atomic>
 #include <fstream>
+#include <mutex>
 #include "inc/amd_hsa_elf.h"
 #include "inc/amd_hsa_kernel_code.h"
 #include "core/inc/amd_hsa_code.hpp"
@@ -110,6 +111,42 @@ void _loader_debug_state() {
 namespace amd {
 namespace hsa {
 namespace loader {
+
+namespace {
+
+void LogHotSwapKernelLookup(const Symbol *symbol) {
+  static const char *LogPath = std::getenv("HSA_HOTSWAP_KERNEL_LOOKUP_LOG");
+  if (!LogPath || !LogPath[0] || !symbol)
+    return;
+
+  const SymbolImpl *Impl = static_cast<const SymbolImpl *>(symbol);
+  if (!Impl->IsKernel())
+    return;
+
+  static std::mutex LogMutex;
+  std::lock_guard<std::mutex> Guard(LogMutex);
+  std::ofstream Out(LogPath, std::ios::app);
+  if (!Out)
+    return;
+  if (!Impl->module_name.empty())
+    Out << Impl->module_name << "::";
+  Out << Impl->symbol_name << "\n";
+}
+
+void LogHotSwapKernelObject(uint64_t address, const std::string &name) {
+  static const char *LogPath = std::getenv("HSA_HOTSWAP_KERNEL_OBJECT_LOG");
+  if (!LogPath || !LogPath[0] || name.empty())
+    return;
+
+  static std::mutex LogMutex;
+  std::lock_guard<std::mutex> Guard(LogMutex);
+  std::ofstream Out(LogPath, std::ios::app);
+  if (!Out)
+    return;
+  Out << "0x" << std::hex << address << std::dec << " " << name << "\n";
+}
+
+} // namespace
 
 class LoaderOptions {
 public:
@@ -1278,6 +1315,7 @@ Symbol* ExecutableImpl::GetSymbolInternal(
   if (!agent) {
     auto program_symbol = program_symbols_.find(mangled_name);
     if (program_symbol != program_symbols_.end()) {
+      LogHotSwapKernelLookup(program_symbol->second.get());
       return program_symbol->second.get();
     }
     return nullptr;
@@ -1285,6 +1323,7 @@ Symbol* ExecutableImpl::GetSymbolInternal(
 
   auto agent_symbol = agent_symbols_.find(std::make_pair(mangled_name, *agent));
   if (agent_symbol != agent_symbols_.end()) {
+    LogHotSwapKernelLookup(agent_symbol->second.get());
     return agent_symbol->second.get();
   }
   return nullptr;
@@ -1647,6 +1686,19 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
     return HSA_STATUS_ERROR_INVALID_CODE_OBJECT;
   }
 
+#ifdef ROCR_HOTSWAP_COMGR_ADAPTER
+  if (std::getenv("HSA_HOTSWAP_PROOF_LOG")) {
+    std::ostringstream proof;
+    proof << "\"event\":\"hsa_load_code_object\""
+          << ",\"code_isa\":\"" << JsonEscape(codeIsa) << "\""
+          << ",\"source_gfx\":\"" << JsonEscape(ExtractGfxName(codeIsa))
+          << "\""
+          << ",\"elf_size\":" << code->ElfSize();
+    if (!AppendHotSwapProofJson(proof.str()))
+      return HSA_STATUS_ERROR;
+  }
+#endif
+
   uint32_t majorVersion, minorVersion;
   if (!code->GetCodeObjectVersion(&majorVersion, &minorVersion)) {
     logger_ << "LoaderError: failed to determine code object's version\n";
@@ -1696,9 +1748,18 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
           ReadHotSwapOriginalGfx(code->ElfData(), code->ElfSize(), sourceGfx,
                                  sourceMach);
       const std::string codeGfx = ExtractGfxName(codeIsa);
+      bool autoInterceptForHotSwap = false;
 
       if (!markedForHotSwap) {
-        if (!codeGfx.empty() && codeGfx != targetGfx) {
+        if (!codeGfx.empty() && codeGfx != targetGfx &&
+            HotSwapEnvEnabled("HSA_HOTSWAP_AUTO_INTERCEPT")) {
+          uint32_t autoSourceMach = 0;
+          if (HotSwapMachFromGfxName(codeGfx, autoSourceMach)) {
+            sourceGfx = codeGfx;
+            sourceMach = static_cast<uint8_t>(autoSourceMach & 0xffu);
+            autoInterceptForHotSwap = true;
+          }
+        } else if (!codeGfx.empty() && codeGfx != targetGfx) {
           std::ostringstream proof;
           proof << "\"event\":\"hotswap_skip\""
                 << ",\"backend\":\"comgr\""
@@ -1709,16 +1770,54 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
           if (!AppendHotSwapProofJson(proof.str()))
             return HSA_STATUS_ERROR;
         }
-      } else if (sourceGfx != targetGfx) {
+      }
+      if ((markedForHotSwap || autoInterceptForHotSwap) &&
+          sourceGfx != targetGfx) {
         const std::string sourceIsa =
             std::string("amdgcn-amd-amdhsa--") + sourceGfx;
         const std::string targetIsa =
             std::string("amdgcn-amd-amdhsa--") + targetGfx;
 
+        const char* skipKernelsEnv = std::getenv("HSA_HOTSWAP_CACHE_SKIP_KERNELS");
+        if (skipKernelsEnv && skipKernelsEnv[0]) {
+          const std::string elfText(
+              reinterpret_cast<const char*>(code->ElfData()), code->ElfSize());
+          std::string skipList(skipKernelsEnv);
+          size_t start = 0;
+          while (start <= skipList.size()) {
+            size_t end = skipList.find(',', start);
+            if (end == std::string::npos) end = skipList.size();
+            std::string name = skipList.substr(start, end - start);
+            size_t first = name.find_first_not_of(" \t\n\r");
+            size_t last = name.find_last_not_of(" \t\n\r");
+            name = (first == std::string::npos) ? "" : name.substr(first, last - first + 1);
+            if (!name.empty() && elfText.find(name) != std::string::npos) {
+              std::ostringstream proof;
+              proof << "\"event\":\"hotswap_skip\""
+                    << ",\"backend\":\"comgr\""
+                    << ",\"reason\":\"kernel_skip\""
+                    << ",\"kernel\":\"" << JsonEscape(name) << "\""
+                    << ",\"source_gfx\":\"" << JsonEscape(sourceGfx) << "\""
+                    << ",\"target_gfx\":\"" << JsonEscape(targetGfx) << "\""
+                    << ",\"elf_size\":" << code->ElfSize();
+              if (!AppendHotSwapProofJson(proof.str()))
+                return HSA_STATUS_ERROR;
+              break;
+            }
+            if (end == skipList.size()) break;
+            start = end + 1;
+          }
+          if (start <= skipList.size() &&
+              elfText.find("__amd_rocclr_fillBufferAligned") != std::string::npos)
+            goto hotswap_translation_done;
+        }
+
         {
           std::ostringstream proof;
           proof << "\"event\":\"transpile_decision\""
-                << ",\"source\":\"loader_ei_pad\""
+                << ",\"source\":\""
+                << (autoInterceptForHotSwap ? "auto_intercept" : "loader_ei_pad")
+                << "\""
                 << ",\"source_gfx\":\"" << JsonEscape(sourceGfx) << "\""
                 << ",\"target_gfx\":\"" << JsonEscape(targetGfx) << "\""
                 << ",\"orig_mach\":\"0x" << std::hex
@@ -1757,6 +1856,8 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
         comgrOptions.cache_skip_kernels =
             std::getenv("HSA_HOTSWAP_CACHE_SKIP_KERNELS");
         comgrOptions.hotswap_rules_path = std::getenv("HSA_HOTSWAP_RULES");
+        comgrOptions.kernel_allowlist =
+            std::getenv("HSA_HOTSWAP_TRANSLATE_KERNELS");
         if (HotSwapEnvEnabled("HSA_HOTSWAP_CACHE_DISABLE"))
           comgrOptions.flags |=
               AMD_COMGR_HOTSWAP_TRANSPILE_OPTIONS_CACHE_DISABLE;
@@ -1866,6 +1967,8 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
           amd_comgr_destroy_hotswap_transpile_result(comgrResult);
         }
       }
+hotswap_translation_done:
+      (void)0;
     }
   }
 #endif
@@ -2086,6 +2189,9 @@ hsa_status_t ExecutableImpl::LoadDefinitionSymbol(hsa_agent_t agent,
                                     64,
                                     uses_wave32 ? 32 : 64,
                                     address);
+    std::string KernelName = kernel_symbol->symbol_name;
+    KernelName.resize(KernelName.size() - 3);
+    LogHotSwapKernelObject(address, KernelName);
     symbol = kernel_symbol;
   } else if (sym->IsVariableSymbol()) {
     symbol = std::make_shared<VariableSymbol>(true,
@@ -2141,6 +2247,7 @@ hsa_status_t ExecutableImpl::LoadDefinitionSymbol(hsa_agent_t agent,
       kernel_symbol->debug_info.elf_size = code->ElfSize();
       kernel_symbol->debug_info.kernel_name = kernel_symbol->full_name.c_str();
       kernel_symbol->debug_info.owning_segment = (void*)SymbolSegment(agent, sym)->Address(sym->GetSection()->addr());
+      LogHotSwapKernelObject(address, kernel_symbol->full_name);
       symbol = kernel_symbol;
 
       // \todo kzhuravl 10/15/15 This is a debugger backdoor: needs to be

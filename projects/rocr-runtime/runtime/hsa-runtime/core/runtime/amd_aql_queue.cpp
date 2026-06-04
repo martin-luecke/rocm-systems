@@ -52,6 +52,8 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <fstream>
+#include <mutex>
 #ifdef _WIN32
 #define WIN32_NO_STATUS
 #include <Windows.h>
@@ -77,6 +79,39 @@
 
 namespace rocr {
 namespace AMD {
+
+namespace {
+
+void LogHotSwapDispatchKernelObject(uint64_t KernelObject) {
+  static const char *LogPath = std::getenv("HSA_HOTSWAP_DISPATCH_LOG");
+  if (!LogPath || !LogPath[0] || KernelObject == 0)
+    return;
+
+  static std::mutex LogMutex;
+  std::lock_guard<std::mutex> Guard(LogMutex);
+  std::ofstream Out(LogPath, std::ios::app);
+  if (!Out)
+    return;
+  Out << "0x" << std::hex << KernelObject << std::dec << "\n";
+}
+
+void LogHotSwapDispatchesInRange(const hsa_queue_t &Queue, uint64_t Begin,
+                                 uint64_t EndInclusive) {
+  if (Queue.base_address == nullptr || Queue.size == 0 || EndInclusive < Begin)
+    return;
+
+  for (uint64_t id = Begin; id <= EndInclusive; ++id) {
+    const uint64_t slot = id & (Queue.size - 1);
+    const core::AqlPacket *packet =
+        &((const core::AqlPacket *)Queue.base_address)[slot];
+    const uint16_t header = packet->packet.header;
+    if (core::AqlPacket::IsValid(header) &&
+        core::AqlPacket::type(header) == HSA_PACKET_TYPE_KERNEL_DISPATCH)
+      LogHotSwapDispatchKernelObject(packet->dispatch.kernel_object);
+  }
+}
+
+} // namespace
 
 #define SCRATCH_ALT_RATIO 4
 
@@ -433,11 +468,31 @@ uint64_t AqlQueue::LoadWriteIndexRelaxed() {
 }
 
 void AqlQueue::StoreWriteIndexRelaxed(uint64_t value) {
+  uint64_t old = LoadWriteIndexRelaxed();
+  for (uint64_t id = old; id < value; ++id) {
+    const uint64_t slot = id & (amd_queue_.hsa_queue.size - 1);
+    const core::AqlPacket *packet =
+        &((const core::AqlPacket *)amd_queue_.hsa_queue.base_address)[slot];
+    const uint16_t header = packet->packet.header;
+    if (core::AqlPacket::IsValid(header) &&
+        core::AqlPacket::type(header) == HSA_PACKET_TYPE_KERNEL_DISPATCH)
+      LogHotSwapDispatchKernelObject(packet->dispatch.kernel_object);
+  }
   atomic::Store(&amd_queue_.write_dispatch_id, value,
                 std::memory_order_relaxed);
 }
 
 void AqlQueue::StoreWriteIndexRelease(uint64_t value) {
+  uint64_t old = LoadWriteIndexRelaxed();
+  for (uint64_t id = old; id < value; ++id) {
+    const uint64_t slot = id & (amd_queue_.hsa_queue.size - 1);
+    const core::AqlPacket *packet =
+        &((const core::AqlPacket *)amd_queue_.hsa_queue.base_address)[slot];
+    const uint16_t header = packet->packet.header;
+    if (core::AqlPacket::IsValid(header) &&
+        core::AqlPacket::type(header) == HSA_PACKET_TYPE_KERNEL_DISPATCH)
+      LogHotSwapDispatchKernelObject(packet->dispatch.kernel_object);
+  }
   atomic::Store(&amd_queue_.write_dispatch_id, value,
                 std::memory_order_release);
 }
@@ -480,6 +535,11 @@ uint64_t AqlQueue::AddWriteIndexRelease(uint64_t value) {
 }
 
 void AqlQueue::StoreRelaxed(hsa_signal_value_t value) {
+  const uint64_t read = atomic::Load(&amd_queue_.read_dispatch_id,
+                                     std::memory_order_relaxed);
+  const uint64_t doorbell = static_cast<uint64_t>(value);
+  LogHotSwapDispatchesInRange(amd_queue_.hsa_queue, read, doorbell);
+
   if (core::Runtime::runtime_singleton_->thunkLoader()->IsDTIF() ||
         core::Runtime::runtime_singleton_->thunkLoader()->IsDXG()) {
     HSAKMT_CALL(hsaKmtQueueRingDoorbell(queue_id_, value));
