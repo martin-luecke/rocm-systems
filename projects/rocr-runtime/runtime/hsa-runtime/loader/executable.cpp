@@ -237,6 +237,42 @@ static std::string ExtractGfxName(const std::string& isa) {
   return isa.substr(pos, end - pos);
 }
 
+// Build a JSON array of the kernel symbol names defined in a code object, for
+// the HotSwap proof log. This is what makes a fat-binary kernel that reaches
+// the loader (e.g. a PyTorch built-in like torch.arange) identifiable in the
+// proof log: we report exactly which kernels the observed code object carries.
+// Capped so a large module cannot blow up the log line.
+static std::string CollectKernelNamesJson(code::AmdHsaCode* code) {
+  std::ostringstream os;
+  os << "[";
+  if (code) {
+    const size_t kMaxNames = 32;
+    size_t emitted = 0;
+    bool truncated = false;
+    const size_t n = code->SymbolCount();
+    for (size_t i = 0; i < n; ++i) {
+      code::Symbol* sym = code->GetSymbol(i);
+      if (!sym) continue;
+      const std::string name = sym->Name();
+      // Cover both code-object representations: pre-v3 kernels surface as
+      // KernelSymbol, while v3+ kernels are ".kd" descriptor *variable* symbols
+      // for which IsKernelSymbol() is false.
+      const bool isKernel =
+          sym->IsKernelSymbol() ||
+          (name.size() >= 3 && name.compare(name.size() - 3, 3, ".kd") == 0);
+      if (!isKernel) continue;
+      if (emitted >= kMaxNames) { truncated = true; break; }
+      if (emitted) os << ",";
+      os << "\"" << JsonEscape(name) << "\"";
+      ++emitted;
+    }
+    // Make truncation observable rather than silently capping the list.
+    if (truncated) os << ",\"...(truncated)\"";
+  }
+  os << "]";
+  return os.str();
+}
+
 static const char* LookupStatusString(
     amd_comgr_hotswap_cache_lookup_status_t status) {
   switch (status) {
@@ -1697,8 +1733,73 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
                                  sourceMach);
       const std::string codeGfx = ExtractGfxName(codeIsa);
 
-      if (!markedForHotSwap) {
-        if (!codeGfx.empty() && codeGfx != targetGfx) {
+      // Configured "source ISA" for the ISA-driven (non-EI_PAD) path. When set,
+      // any unmarked code object whose own ISA matches it is treated as a
+      // HotSwap candidate even though no intercept shim marked it -- this is how
+      // fat-binary kernels that reach the loader natively (e.g. a PyTorch
+      // built-in compiled for the target arch) get pulled through the HotSwap
+      // path and reported. Empty => only EI_PAD-marked objects are considered.
+      const char* sourceIsaEnvRaw = std::getenv("HSA_HOTSWAP_SOURCE_ISA");
+      const std::string sourceIsaEnv =
+          ExtractGfxName(sourceIsaEnvRaw ? sourceIsaEnvRaw : "");
+
+      // Unified transpile decision shared by the EI_PAD and ISA-match paths.
+      bool doTranspile = false;
+      std::string xpSourceGfx;       // ISA name handed to COMGR as the source
+      uint8_t xpSourceMach = 0;      // mach byte to stamp into e_ident-restored e_flags
+      const char* decisionSource = "loader_ei_pad";
+
+      if (markedForHotSwap) {
+        // Shim-marked (Triton/module-load) path: unchanged behavior.
+        if (sourceGfx != targetGfx) {
+          doTranspile = true;
+          xpSourceGfx = sourceGfx;
+          xpSourceMach = sourceMach;
+        }
+      } else {
+        // ISA-driven path for unmarked code objects.
+        const bool isaMatches =
+            !sourceIsaEnv.empty() && !codeGfx.empty() && codeGfx == sourceIsaEnv;
+        if (isaMatches) {
+          uint32_t codeMach = 0;
+          const bool haveMach = HotSwapMachFromGfxName(codeGfx, codeMach);
+          if (codeGfx != targetGfx && !haveMach) {
+            // Source ISA reached the loader but we cannot map it to a MACH byte
+            // to stamp for COMGR; refuse loudly rather than feed it mach 0.
+            std::ostringstream proof;
+            proof << "\"event\":\"hotswap_skip\""
+                  << ",\"backend\":\"comgr\""
+                  << ",\"reason\":\"unknown_source_mach\""
+                  << ",\"source_gfx\":\"" << JsonEscape(codeGfx) << "\""
+                  << ",\"target_gfx\":\"" << JsonEscape(targetGfx) << "\"";
+            if (!AppendHotSwapProofJson(proof.str()))
+              return HSA_STATUS_ERROR;
+          } else if (codeGfx != targetGfx) {
+            // Distinct source ISA that nonetheless reached the loader (e.g. a
+            // multi-arch bundle whose native target entry was replaced, or a
+            // shim-forced source translation). Translate it.
+            doTranspile = true;
+            xpSourceGfx = codeGfx;
+            xpSourceMach = static_cast<uint8_t>(codeMach);
+            decisionSource = "loader_isa_match";
+          } else {
+            // Same-arch object: there is no identity transpile (the transpiler
+            // only ingests the source ISA). Report that the kernel was seen by
+            // HotSwap and execute the original bytes directly.
+            std::ostringstream proof;
+            proof << "\"event\":\"hotswap_passthrough\""
+                  << ",\"backend\":\"comgr\""
+                  << ",\"reason\":\"already_target\""
+                  << ",\"source_gfx\":\"" << JsonEscape(codeGfx) << "\""
+                  << ",\"target_gfx\":\"" << JsonEscape(targetGfx) << "\""
+                  << ",\"code_isa\":\"" << JsonEscape(codeIsa) << "\""
+                  << ",\"elf_size\":" << code->ElfSize()
+                  << ",\"kernels\":" << CollectKernelNamesJson(code.get());
+            if (!AppendHotSwapProofJson(proof.str()))
+              return HSA_STATUS_ERROR;
+          }
+        } else if (!codeGfx.empty() && codeGfx != targetGfx) {
+          // Unmarked, ISA does not match the configured source: skip (unchanged).
           std::ostringstream proof;
           proof << "\"event\":\"hotswap_skip\""
                 << ",\"backend\":\"comgr\""
@@ -1709,21 +1810,24 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
           if (!AppendHotSwapProofJson(proof.str()))
             return HSA_STATUS_ERROR;
         }
-      } else if (sourceGfx != targetGfx) {
+      }
+
+      if (doTranspile) {
         const std::string sourceIsa =
-            std::string("amdgcn-amd-amdhsa--") + sourceGfx;
+            std::string("amdgcn-amd-amdhsa--") + xpSourceGfx;
         const std::string targetIsa =
             std::string("amdgcn-amd-amdhsa--") + targetGfx;
 
         {
           std::ostringstream proof;
           proof << "\"event\":\"transpile_decision\""
-                << ",\"source\":\"loader_ei_pad\""
-                << ",\"source_gfx\":\"" << JsonEscape(sourceGfx) << "\""
+                << ",\"source\":\"" << decisionSource << "\""
+                << ",\"source_gfx\":\"" << JsonEscape(xpSourceGfx) << "\""
                 << ",\"target_gfx\":\"" << JsonEscape(targetGfx) << "\""
                 << ",\"orig_mach\":\"0x" << std::hex
-                << static_cast<unsigned>(sourceMach) << std::dec << "\""
-                << ",\"code_isa\":\"" << JsonEscape(codeIsa) << "\"";
+                << static_cast<unsigned>(xpSourceMach) << std::dec << "\""
+                << ",\"code_isa\":\"" << JsonEscape(codeIsa) << "\""
+                << ",\"kernels\":" << CollectKernelNamesJson(code.get());
           if (!AppendHotSwapProofJson(proof.str()))
             return HSA_STATUS_ERROR;
         }
@@ -1732,7 +1836,7 @@ hsa_status_t ExecutableImpl::LoadCodeObject(
             reinterpret_cast<const uint8_t*>(code->ElfData()),
             reinterpret_cast<const uint8_t*>(code->ElfData()) + code->ElfSize());
         if (comgrSource.size() > 48)
-          comgrSource[48] = sourceMach;
+          comgrSource[48] = xpSourceMach;
 
         amd_comgr_data_t comgrInput = {0};
         amd_comgr_status_t comgrStatus =
