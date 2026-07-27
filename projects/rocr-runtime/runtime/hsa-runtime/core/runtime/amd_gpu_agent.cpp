@@ -2333,6 +2333,9 @@ hsa_status_t GpuAgent::GetInfo(hsa_agent_info_t attribute, void* value) const {
     case HSA_AGENT_INFO_ISA:
       *((hsa_isa_t*)value) = core::Isa::Handle(supported_isas()[0]);
       break;
+    case HSA_AMD_AGENT_INFO_EXECUTION_ISA:
+      *((hsa_isa_t*)value) = core::Isa::Handle(supported_isas()[0]);
+      break;
     case HSA_AGENT_INFO_EXTENSIONS: {
       memset(value, 0, sizeof(uint8_t) * 128);
 

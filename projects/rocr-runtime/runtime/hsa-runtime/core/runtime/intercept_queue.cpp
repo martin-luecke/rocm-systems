@@ -434,7 +434,6 @@ void InterceptQueue::StoreRelaxed(hsa_signal_value_t value) {
 hsa_status_t InterceptQueue::GetInfo(hsa_queue_info_attribute_t attribute, void* value) {
   switch (attribute) {
     case HSA_AMD_QUEUE_INFO_AGENT:
-    case HSA_AMD_QUEUE_INFO_DOORBELL_ID: 
     case HSA_QUEUE_INFO_USE_COUNT:
     case HSA_QUEUE_INFO_HW_ID:
     case HSA_AMD_QUEUE_INFO_ENGINE_TYPE:
@@ -444,6 +443,10 @@ hsa_status_t InterceptQueue::GetInfo(hsa_queue_info_attribute_t attribute, void*
       AMD::AqlQueue* aqlQueue = static_cast<AMD::AqlQueue*>(wrapped.get());
       return aqlQueue->GetInfo(attribute, value);
     }
+    case HSA_AMD_QUEUE_INFO_DOORBELL_ID:
+      // Returning the wrapped queue's doorbell would let clients bypass the
+      // proxy ring and all registered packet interceptors.
+      return HSA_STATUS_ERROR_INVALID_ARGUMENT;
   }
   return HSA_STATUS_ERROR_INVALID_ARGUMENT;
 }

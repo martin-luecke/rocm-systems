@@ -2909,9 +2909,13 @@ void Runtime::LoadTools() {
       }
     }
 
-    // if rocprofiler library supports registration and v1 support not explicitly requested,
-    // do not use old method
-    if (rocp_reg_status == ROCP_REG_SUCCESS && !allow_v1_registration) return;
+    // Explicitly requested API tools are independent of profiler
+    // registration and must still participate in normal tool chaining.
+    const bool explicit_api_tools = !flag_.tools_lib_names().empty();
+    if (rocp_reg_status == ROCP_REG_SUCCESS && !allow_v1_registration &&
+        !explicit_api_tools) {
+      return;
+    }
   }
 #endif
 
