@@ -2288,6 +2288,14 @@ class Device : public RuntimeObject {
     return *isa_;
   }
 
+  //! Returns the immutable physical ISA used for hardware-adjacent policy.
+  const Isa& executionIsa() const {
+    assert(executionIsa_);
+    return *executionIsa_;
+  }
+
+  void setExecutionIsa(const Isa& isa) { executionIsa_ = &isa; }
+
   //! Return a non-zero uint64_t value that uniquely identifies the device.
   //! This can be used when a scalar value handle to the device is require.
   static uint64_t toHandle(const Device* device) {
@@ -2494,7 +2502,8 @@ class Device : public RuntimeObject {
   std::unordered_map<amd::CommandQueue*, bool> activeQueues;  //!< The set of active queues
   uint8_t group_mem_carveout_hint_{0}; //!< LDS carveout percentage (0 = no preference)
  private:
-  const Isa* isa_;  //!< Device isa
+  const Isa* isa_;           //!< Presented/code-selection ISA
+  const Isa* executionIsa_;  //!< Physical hardware execution ISA
   bool IsTypeMatching(cl_device_type type, bool offlineDevices);
 
 #if defined(WITH_HSA_DEVICE)
